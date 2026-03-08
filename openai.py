@@ -532,6 +532,8 @@ class SessionPool:
             raise RuntimeError("No valid accounts in pool")
         acc = self._pick_account(good)
         acc.active += 1
+        acc.request_count += 1
+        acc.last_used_at = _now_ts()
         return acc.snapshot()
 
     def _release_by_user_id(self, user_id: str) -> None:

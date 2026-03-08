@@ -90,7 +90,7 @@ async function loadDashboard() {
     document.getElementById('accounts').innerHTML = data.accounts.map(acc => `
       <tr>
         <td><div><strong>${acc.username || 'Guest'}</strong></div><div class="hint">${acc.user_id}</div></td>
-        <td><span class="pill ${acc.valid ? 'ok' : 'bad'}">${acc.valid ? '正常' : '失效'}</span> <span class="pill busy">并发 ${acc.active}</span></td>
+        <td><span class="pill ${acc.valid ? 'ok' : 'bad'}">${acc.valid ? '正常' : '失效'}</span></td>
         <td>${acc.request_count}</td>
         <td>${acc.success_count}</td>
         <td>${acc.failure_count}</td>
