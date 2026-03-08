@@ -21,7 +21,9 @@ body {
   min-height: 100vh;
 }
 .shell { max-width: 1320px; margin: 0 auto; padding: 28px; }
+.hidden { display: none; }
 .hero, .card { background: var(--panel); border: 1px solid var(--line); backdrop-filter: blur(20px); border-radius: 28px; box-shadow: var(--shadow); }
+.login-card { max-width: 520px; margin: 48px auto 0; }
 .hero { padding: 28px; position: relative; overflow: hidden; }
 .hero::after { content: ""; position: absolute; inset: auto -80px -80px auto; width: 240px; height: 240px; background: radial-gradient(circle, rgba(255,122,162,.28), transparent 70%); }
 .badge { display: inline-flex; padding: 8px 12px; border-radius: 999px; background: rgba(255,255,255,.6); color: #d75f86; font-size: 12px; letter-spacing: .12em; text-transform: uppercase; }

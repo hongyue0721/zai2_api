@@ -8,6 +8,7 @@ import logging
 import math
 import os
 from pathlib import Path
+import hashlib
 import re
 import secrets
 import string
@@ -58,6 +59,8 @@ if not HTTP_DEBUG:
 
 POOL_SIZE = int(os.getenv("POOL_SIZE", "3"))
 TOKEN_MAX_AGE = int(os.getenv("TOKEN_MAX_AGE", "480"))  # seconds
+REBUILD_COOLDOWN = int(os.getenv("REBUILD_COOLDOWN", "30"))
+REBUILD_MAX_RETRIES = int(os.getenv("REBUILD_MAX_RETRIES", "3"))
 STATE_FILE = Path(__file__).with_name("webui_state.json")
 ADMIN_DIR = Path(__file__).with_name("web")
 ADMIN_INDEX = ADMIN_DIR / "admin.html"
@@ -80,12 +83,20 @@ def _random_api_key(length: int = 32, prefix: str = "sk-zai-") -> str:
     return prefix + "".join(secrets.choice(alphabet) for _ in range(length))
 
 
+def _hash_password(password: str) -> str:
+    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+
 class APIKeyStore:
     def __init__(self, path: Path) -> None:
         self.path = path
         self._lock = asyncio.Lock()
         self._keys: list[dict[str, Any]] = []
         self._target_pool_size = POOL_SIZE
+        self._rebuild_cooldown = REBUILD_COOLDOWN
+        self._rebuild_max_retries = REBUILD_MAX_RETRIES
+        self._admin_password_hash = _hash_password("zai2api")
+        self._admin_sessions: dict[str, float] = {}
         self._load()
 
     def _load(self) -> None:
@@ -102,11 +113,23 @@ class APIKeyStore:
         target = data.get("target_pool_size")
         if isinstance(target, int) and target > 0:
             self._target_pool_size = target
+        password_hash = data.get("admin_password_hash")
+        if isinstance(password_hash, str) and password_hash:
+            self._admin_password_hash = password_hash
+        rebuild_cooldown = data.get("rebuild_cooldown")
+        if isinstance(rebuild_cooldown, int) and rebuild_cooldown >= 0:
+            self._rebuild_cooldown = rebuild_cooldown
+        rebuild_max_retries = data.get("rebuild_max_retries")
+        if isinstance(rebuild_max_retries, int) and rebuild_max_retries > 0:
+            self._rebuild_max_retries = rebuild_max_retries
 
     def _save_unlocked(self) -> None:
         payload = {
             "api_keys": self._keys,
             "target_pool_size": self._target_pool_size,
+            "admin_password_hash": self._admin_password_hash,
+            "rebuild_cooldown": self._rebuild_cooldown,
+            "rebuild_max_retries": self._rebuild_max_retries,
         }
         self.path.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2),
@@ -177,6 +200,74 @@ class APIKeyStore:
         async with self._lock:
             self._target_pool_size = size
             self._save_unlocked()
+
+    async def verify_admin_password(self, password: str) -> bool:
+        async with self._lock:
+            return secrets.compare_digest(
+                self._admin_password_hash, _hash_password(password)
+            )
+
+    async def change_admin_password(
+        self, current_password: str, new_password: str
+    ) -> None:
+        if len(new_password) < 6:
+            raise ValueError("新密码至少需要 6 个字符")
+        async with self._lock:
+            if not secrets.compare_digest(
+                self._admin_password_hash, _hash_password(current_password)
+            ):
+                raise ValueError("当前密码不正确")
+            self._admin_password_hash = _hash_password(new_password)
+            self._admin_sessions.clear()
+            self._save_unlocked()
+
+    async def create_admin_session(self) -> str:
+        async with self._lock:
+            token = secrets.token_urlsafe(32)
+            self._admin_sessions[token] = _now_ts() + 7 * 24 * 3600
+            return token
+
+    async def is_valid_admin_session(self, token: str | None) -> bool:
+        if not token:
+            return False
+        async with self._lock:
+            expires_at = self._admin_sessions.get(token)
+            if not expires_at:
+                return False
+            if expires_at < _now_ts():
+                self._admin_sessions.pop(token, None)
+                return False
+            self._admin_sessions[token] = _now_ts() + 7 * 24 * 3600
+            return True
+
+    async def clear_admin_session(self, token: str | None) -> None:
+        if not token:
+            return
+        async with self._lock:
+            self._admin_sessions.pop(token, None)
+
+    async def get_rebuild_settings(self) -> dict[str, int]:
+        async with self._lock:
+            return {
+                "rebuild_cooldown": self._rebuild_cooldown,
+                "rebuild_max_retries": self._rebuild_max_retries,
+            }
+
+    async def update_rebuild_settings(
+        self, rebuild_cooldown: int, rebuild_max_retries: int
+    ) -> dict[str, int]:
+        if rebuild_cooldown < 0:
+            raise ValueError("冷却时间不能小于 0")
+        if rebuild_max_retries < 1:
+            raise ValueError("重试上限至少为 1")
+        async with self._lock:
+            self._rebuild_cooldown = rebuild_cooldown
+            self._rebuild_max_retries = rebuild_max_retries
+            self._save_unlocked()
+            return {
+                "rebuild_cooldown": self._rebuild_cooldown,
+                "rebuild_max_retries": self._rebuild_max_retries,
+            }
 
 
 key_store = APIKeyStore(STATE_FILE)
@@ -249,6 +340,11 @@ class SessionPool:
         self._accounts: list[AccountInfo] = []
         self._bg_task: asyncio.Task | None = None
         self._target_size = POOL_SIZE
+        self._rr_cursor = 0
+        self._rebuild_attempts: dict[str, list[float]] = {}
+        self._last_rebuild_at = 0.0
+        self._rebuild_cooldown = REBUILD_COOLDOWN
+        self._rebuild_max_retries = REBUILD_MAX_RETRIES
 
     # ── internal ─────────────────────────────────────────────────────
 
@@ -302,10 +398,37 @@ class SessionPool:
             except Exception:
                 pass
 
+    def _pick_account(self, accounts: list[AccountInfo]) -> AccountInfo:
+        min_active = min(a.active for a in accounts)
+        candidates = [a for a in accounts if a.active == min_active]
+        if len(candidates) == 1:
+            return candidates[0]
+        start = self._rr_cursor % len(candidates)
+        chosen = candidates[start]
+        self._rr_cursor = (self._rr_cursor + 1) % max(len(candidates), 1)
+        return chosen
+
+    def _can_rebuild_now(self, failed_user_id: str | None = None) -> bool:
+        now = _now_ts()
+        if now - self._last_rebuild_at < self._rebuild_cooldown:
+            return False
+        key = failed_user_id or "global"
+        attempts = [ts for ts in self._rebuild_attempts.get(key, []) if now - ts < 300]
+        self._rebuild_attempts[key] = attempts
+        if len(attempts) >= self._rebuild_max_retries:
+            return False
+        attempts.append(now)
+        self._rebuild_attempts[key] = attempts
+        self._last_rebuild_at = now
+        return True
+
     # ── public API ───────────────────────────────────────────────────
 
     async def initialize(self) -> None:
         self._target_size = await key_store.get_target_pool_size()
+        rebuild_settings = await key_store.get_rebuild_settings()
+        self._rebuild_cooldown = rebuild_settings["rebuild_cooldown"]
+        self._rebuild_max_retries = rebuild_settings["rebuild_max_retries"]
         async with self._lock:
             results = await asyncio.gather(
                 *[self._new_account() for _ in range(self._target_size)],
@@ -338,7 +461,7 @@ class SessionPool:
                     acc = await self._new_account()
                     self._accounts.append(acc)
                     good = [acc]
-        acc = min(good, key=lambda a: a.active)
+        acc = self._pick_account(good)
         acc.active += 1
         acc.request_count += 1
         acc.last_used_at = _now_ts()
@@ -388,12 +511,17 @@ class SessionPool:
                 a.last_error = ""
                 return
 
-    def mark_failure(self, user_id: str, error: str) -> None:
+    async def mark_failure(self, user_id: str, error: str) -> None:
+        found = False
         for a in self._accounts:
             if a.user_id == user_id:
                 a.failure_count += 1
                 a.last_error = error[:240]
-                return
+                a.valid = False
+                found = True
+                break
+        if found:
+            await self.refresh_auth(user_id)
 
     def get_auth_snapshot(self) -> dict[str, str]:
         """Get auth snapshot from the least-busy valid account."""
@@ -402,7 +530,7 @@ class SessionPool:
             good = [a for a in self._accounts if a.valid]
         if not good:
             raise RuntimeError("No valid accounts in pool")
-        acc = min(good, key=lambda a: a.active)
+        acc = self._pick_account(good)
         acc.active += 1
         return acc.snapshot()
 
@@ -425,6 +553,14 @@ class SessionPool:
                         "SessionPool: invalidated failed account uid=%s", failed_user_id
                     )
                     break
+        if not self._can_rebuild_now(failed_user_id):
+            logger.warning(
+                "SessionPool: rebuild skipped due to cooldown/retry cap uid=%s cooldown=%ss max=%d",
+                failed_user_id,
+                self._rebuild_cooldown,
+                self._rebuild_max_retries,
+            )
+            return
         try:
             acc = await self._new_account()
             async with self._lock:
@@ -432,6 +568,16 @@ class SessionPool:
             logger.info("SessionPool: auth refreshed, new user_id=%s", acc.user_id)
         except Exception as e:
             logger.warning("SessionPool: refresh_auth failed: %s", e)
+
+    async def update_rebuild_settings(
+        self, rebuild_cooldown: int, rebuild_max_retries: int
+    ) -> dict[str, int]:
+        settings = await key_store.update_rebuild_settings(
+            rebuild_cooldown, rebuild_max_retries
+        )
+        self._rebuild_cooldown = settings["rebuild_cooldown"]
+        self._rebuild_max_retries = settings["rebuild_max_retries"]
+        return settings
 
     async def cleanup_chats(self) -> None:
         """Clean up chats for idle accounts to free concurrency slots."""
@@ -498,6 +644,8 @@ class SessionPool:
             "success_rate": round((total_success / total_requests) * 100, 1)
             if total_requests
             else 0.0,
+            "rebuild_cooldown": self._rebuild_cooldown,
+            "rebuild_max_retries": self._rebuild_max_retries,
             "accounts": accounts,
         }
 
@@ -993,6 +1141,14 @@ async def _ensure_request_allowed(request: Request) -> str | None:
     return None
 
 
+async def _admin_authed(request: Request) -> bool:
+    return await key_store.is_valid_admin_session(request.cookies.get("admin_session"))
+
+
+def _admin_auth_failed() -> JSONResponse:
+    return JSONResponse(status_code=401, content={"message": "Admin auth required"})
+
+
 def _unauthorized_response() -> JSONResponse:
     return JSONResponse(
         status_code=401,
@@ -1016,14 +1172,14 @@ ADMIN_HTML_FALLBACK = """<!DOCTYPE html>
 <head>
   <meta charset=\"UTF-8\" />
   <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />
-  <title>ZAI2API Control Room</title>
+  <title>zai2api</title>
   <link rel=\"stylesheet\" href=\"/admin/assets/admin.css\" />
 </head>
 <body>
   <div class=\"shell\">
     <section class=\"hero\">
-      <div class=\"badge\">Magical Ops</div>
-      <h1>Free Account Control Room</h1>
+      <div class=\"badge\">zai2api</div>
+      <h1>zai2api</h1>
       <div class=\"sub\">Google AI Studio 气质 + 二次元糖霜感，实时监控账号、成功率、Key、健康度与最近趋势。</div>
     </section>
 
@@ -1285,7 +1441,9 @@ async def list_models(request: Request):
 
 
 @app.get("/admin", response_class=HTMLResponse)
-async def admin_page():
+async def admin_page(request: Request):
+    if not await _admin_authed(request):
+        return HTMLResponse(_read_admin_asset(ADMIN_INDEX, ADMIN_HTML_FALLBACK))
     return HTMLResponse(_read_admin_asset(ADMIN_INDEX, ADMIN_HTML_FALLBACK))
 
 
@@ -1305,8 +1463,68 @@ async def admin_js():
     )
 
 
+@app.post("/admin/api/login")
+async def admin_login(request: Request):
+    body = await request.json()
+    password = str(body.get("password", "") or "")
+    if not await key_store.verify_admin_password(password):
+        return JSONResponse(status_code=401, content={"message": "密码错误"})
+    token = await key_store.create_admin_session()
+    response = JSONResponse({"ok": True})
+    response.set_cookie(
+        key="admin_session",
+        value=token,
+        httponly=True,
+        samesite="lax",
+        max_age=7 * 24 * 3600,
+    )
+    return response
+
+
+@app.post("/admin/api/logout")
+async def admin_logout(request: Request):
+    await key_store.clear_admin_session(request.cookies.get("admin_session"))
+    response = JSONResponse({"ok": True})
+    response.delete_cookie("admin_session")
+    return response
+
+
+@app.post("/admin/api/change-password")
+async def admin_change_password(request: Request):
+    if not await _admin_authed(request):
+        return _admin_auth_failed()
+    body = await request.json()
+    try:
+        await key_store.change_admin_password(
+            str(body.get("current_password", "") or ""),
+            str(body.get("new_password", "") or ""),
+        )
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"message": str(e)})
+    response = JSONResponse({"ok": True, "message": "密码已更新，请重新登录"})
+    response.delete_cookie("admin_session")
+    return response
+
+
+@app.post("/admin/api/rebuild-settings")
+async def admin_update_rebuild_settings(request: Request):
+    if not await _admin_authed(request):
+        return _admin_auth_failed()
+    body = await request.json()
+    try:
+        settings = await pool.update_rebuild_settings(
+            int(body.get("rebuild_cooldown", 0)),
+            int(body.get("rebuild_max_retries", 1)),
+        )
+    except (ValueError, TypeError) as e:
+        return JSONResponse(status_code=400, content={"message": str(e)})
+    return {"ok": True, **settings}
+
+
 @app.get("/admin/api/dashboard")
-async def admin_dashboard():
+async def admin_dashboard(request: Request):
+    if not await _admin_authed(request):
+        return _admin_auth_failed()
     data = pool.dashboard()
     keys = await key_store.list_keys()
     data["api_key_count"] = len(keys)
@@ -1314,7 +1532,9 @@ async def admin_dashboard():
 
 
 @app.get("/admin/api/keys")
-async def admin_list_keys():
+async def admin_list_keys(request: Request):
+    if not await _admin_authed(request):
+        return _admin_auth_failed()
     keys = await key_store.list_keys()
     return {
         "data": [
@@ -1330,6 +1550,8 @@ async def admin_list_keys():
 
 @app.post("/admin/api/keys")
 async def admin_create_key(request: Request):
+    if not await _admin_authed(request):
+        return _admin_auth_failed()
     body = await request.json()
     try:
         item = await key_store.create_key(
@@ -1346,20 +1568,26 @@ async def admin_create_key(request: Request):
 
 
 @app.delete("/admin/api/keys/{key_id}")
-async def admin_delete_key(key_id: str):
+async def admin_delete_key(key_id: str, request: Request):
+    if not await _admin_authed(request):
+        return _admin_auth_failed()
     if await key_store.delete_key(key_id):
         return {"ok": True}
     return JSONResponse(status_code=404, content={"message": "Key 不存在"})
 
 
 @app.post("/admin/api/accounts")
-async def admin_add_account():
+async def admin_add_account(request: Request):
+    if not await _admin_authed(request):
+        return _admin_auth_failed()
     account = await pool.add_account()
     return {"ok": True, "account": account}
 
 
 @app.delete("/admin/api/accounts/{user_id}")
-async def admin_remove_account(user_id: str):
+async def admin_remove_account(user_id: str, request: Request):
+    if not await _admin_authed(request):
+        return _admin_auth_failed()
     removed = await pool.remove_account(user_id)
     if removed:
         return {"ok": True}
@@ -1599,7 +1827,7 @@ async def chat_completions(request: Request):
 
                 except (httpcore.RemoteProtocolError, httpx.RemoteProtocolError) as e:
                     if current_uid:
-                        pool.mark_failure(current_uid, str(e))
+                        await pool.mark_failure(current_uid, str(e))
                     logger.error(
                         "[stream][%s] server disconnected: %s", completion_id, e
                     )
@@ -1618,12 +1846,12 @@ async def chat_completions(request: Request):
                     logger.info(
                         "[stream][%s] switching account and retrying...", completion_id
                     )
-                    await pool.refresh_auth(current_uid)
+
                     current_uid = None
                     continue
                 except (httpcore.ReadTimeout, httpx.ReadTimeout) as e:
                     if current_uid:
-                        pool.mark_failure(current_uid, str(e))
+                        await pool.mark_failure(current_uid, str(e))
                     logger.error("[stream][%s] read timeout: %s", completion_id, e)
                     if client is not None:
                         if chat_id:
@@ -1640,12 +1868,12 @@ async def chat_completions(request: Request):
 
                     retried = True
                     logger.info("[stream][%s] retrying after timeout...", completion_id)
-                    await pool.refresh_auth(current_uid)
+
                     current_uid = None
                     continue
                 except httpx.HTTPStatusError as e:
                     if current_uid:
-                        pool.mark_failure(current_uid, str(e))
+                        await pool.mark_failure(current_uid, str(e))
                     # Handle upstream 400 with concurrency limit (code 429)
                     is_concurrency = False
                     try:
@@ -1680,12 +1908,12 @@ async def chat_completions(request: Request):
                         )
                         await pool.cleanup_chats()
                         await asyncio.sleep(1)
-                    await pool.refresh_auth(current_uid)
+
                     current_uid = None
                     continue
                 except Exception as e:
                     if current_uid:
-                        pool.mark_failure(current_uid, str(e))
+                        await pool.mark_failure(current_uid, str(e))
                     logger.exception("[stream][%s] exception: %s", completion_id, e)
                     if client is not None:
                         if chat_id:
@@ -1702,7 +1930,7 @@ async def chat_completions(request: Request):
                     logger.info(
                         "[stream][%s] refreshing auth and retrying...", completion_id
                     )
-                    await pool.refresh_auth(current_uid)
+
                     current_uid = None
                     continue
                 finally:
@@ -1839,7 +2067,7 @@ async def chat_completions(request: Request):
 
         except httpx.HTTPStatusError as e:
             if current_uid:
-                pool.mark_failure(current_uid, str(e))
+                await pool.mark_failure(current_uid, str(e))
             is_concurrency = False
             try:
                 err_body = e.response.json() if e.response else {}
@@ -1863,7 +2091,7 @@ async def chat_completions(request: Request):
                 if is_concurrency:
                     await pool.cleanup_chats()
                     await asyncio.sleep(1)
-                await pool.refresh_auth(current_uid)
+
                 current_uid = None
                 continue
             return JSONResponse(
@@ -1879,7 +2107,7 @@ async def chat_completions(request: Request):
             )
         except Exception as e:
             if current_uid:
-                pool.mark_failure(current_uid, str(e))
+                await pool.mark_failure(current_uid, str(e))
             logger.exception("[sync][%s] exception: %s", completion_id, e)
             if client is not None:
                 if chat_id:
@@ -1889,7 +2117,6 @@ async def chat_completions(request: Request):
                 chat_id = None
 
             if attempt == 0:
-                await pool.refresh_auth(current_uid)
                 current_uid = None
                 continue
             return JSONResponse(
@@ -2129,7 +2356,7 @@ async def _claude_stream(msg_id, model, run_once, has_fc, usage_prompt):
 
         except (httpcore.ReadTimeout, httpx.ReadTimeout) as e:
             if current_uid:
-                pool.mark_failure(current_uid, str(e))
+                await pool.mark_failure(current_uid, str(e))
             logger.error("[claude-stream][%s] timeout: %s", msg_id, e)
             if client:
                 if chat_id:
@@ -2140,12 +2367,12 @@ async def _claude_stream(msg_id, model, run_once, has_fc, usage_prompt):
                 yield sse_error("overloaded_error", "Upstream timeout")
                 return
             retried = True
-            await pool.refresh_auth(current_uid)
+
             current_uid = None
             continue
         except (httpcore.RemoteProtocolError, httpx.RemoteProtocolError) as e:
             if current_uid:
-                pool.mark_failure(current_uid, str(e))
+                await pool.mark_failure(current_uid, str(e))
             logger.error("[claude-stream][%s] server disconnected: %s", msg_id, e)
             if client:
                 if chat_id:
@@ -2156,12 +2383,12 @@ async def _claude_stream(msg_id, model, run_once, has_fc, usage_prompt):
                 yield sse_error("api_error", "Server disconnected, please retry")
                 return
             retried = True
-            await pool.refresh_auth(current_uid)
+
             current_uid = None
             continue
         except httpx.HTTPStatusError as e:
             if current_uid:
-                pool.mark_failure(current_uid, str(e))
+                await pool.mark_failure(current_uid, str(e))
             is_concurrency = False
             try:
                 err_body = e.response.json() if e.response else {}
@@ -2196,12 +2423,12 @@ async def _claude_stream(msg_id, model, run_once, has_fc, usage_prompt):
                 )
                 await pool.cleanup_chats()
                 await asyncio.sleep(1)
-            await pool.refresh_auth(current_uid)
+
             current_uid = None
             continue
         except Exception as e:
             if current_uid:
-                pool.mark_failure(current_uid, str(e))
+                await pool.mark_failure(current_uid, str(e))
             logger.exception("[claude-stream][%s] error: %s", msg_id, e)
             if client:
                 if chat_id:
@@ -2212,7 +2439,7 @@ async def _claude_stream(msg_id, model, run_once, has_fc, usage_prompt):
                 yield sse_error("api_error", "Upstream error after retry")
                 return
             retried = True
-            await pool.refresh_auth(current_uid)
+
             current_uid = None
             continue
         finally:
@@ -2269,7 +2496,7 @@ async def _claude_sync(msg_id, model, run_once, has_fc, usage_prompt):
 
         except httpx.HTTPStatusError as e:
             if current_uid:
-                pool.mark_failure(current_uid, str(e))
+                await pool.mark_failure(current_uid, str(e))
             is_concurrency = False
             try:
                 err_body = e.response.json() if e.response else {}
@@ -2293,7 +2520,7 @@ async def _claude_sync(msg_id, model, run_once, has_fc, usage_prompt):
                 if is_concurrency:
                     await pool.cleanup_chats()
                     await asyncio.sleep(1)
-                await pool.refresh_auth(current_uid)
+
                 current_uid = None
                 continue
             return JSONResponse(
@@ -2310,7 +2537,7 @@ async def _claude_sync(msg_id, model, run_once, has_fc, usage_prompt):
             )
         except Exception as e:
             if current_uid:
-                pool.mark_failure(current_uid, str(e))
+                await pool.mark_failure(current_uid, str(e))
             logger.exception("[claude-sync][%s] error: %s", msg_id, e)
             if client:
                 if chat_id:
@@ -2319,7 +2546,6 @@ async def _claude_sync(msg_id, model, run_once, has_fc, usage_prompt):
                 client = None
                 chat_id = None
             if attempt == 0:
-                await pool.refresh_auth(current_uid)
                 current_uid = None
                 continue
             return JSONResponse(

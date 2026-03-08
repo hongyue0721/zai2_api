@@ -3,14 +3,24 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>ZAI2API Control Room</title>
+  <title>zai2api</title>
   <link rel="stylesheet" href="/admin/assets/admin.css" />
 </head>
 <body>
   <div class="shell">
+    <section class="card login-card" id="login-card">
+      <div class="section-head"><strong>Admin 登录</strong><span class="hint">初始密码：zai2api</span></div>
+      <form id="login-form">
+        <input type="password" name="password" placeholder="输入管理密码" />
+        <button type="submit">登录后台</button>
+      </form>
+      <div class="msg" id="login-msg"></div>
+    </section>
+
+    <div id="admin-app" class="hidden">
     <section class="hero">
-      <div class="badge">Magical Ops</div>
-      <h1>Free Account Control Room</h1>
+      <div class="badge">zai2api</div>
+      <h1>zai2api</h1>
       <div class="sub">Google AI Studio 气质 + 二次元糖霜感，实时监控账号、成功率、Key、健康度与最近趋势。</div>
     </section>
 
@@ -52,7 +62,26 @@
           <tbody id="keys"></tbody>
         </table>
       </div>
+
+      <div class="card">
+        <strong>设置</strong>
+        <div class="hint" style="margin:8px 0 14px;">你可以在这里修改 admin 密码，以及失败重建的冷却与重试上限。</div>
+        <form id="password-form">
+          <input type="password" name="current_password" placeholder="当前密码" />
+          <input type="password" name="new_password" placeholder="新密码，至少 6 位" />
+          <button type="submit">修改密码</button>
+        </form>
+        <div class="msg" id="password-msg"></div>
+        <form id="rebuild-form" style="margin-top:14px;">
+          <input type="number" name="rebuild_cooldown" min="0" placeholder="失败重建冷却时间（秒）" />
+          <input type="number" name="rebuild_max_retries" min="1" placeholder="5 分钟内重试上限" />
+          <button type="submit">保存重建策略</button>
+        </form>
+        <div class="msg" id="rebuild-msg"></div>
+        <div class="row"><button class="ghost" onclick="logout()">退出登录</button></div>
+      </div>
     </section>
+    </div>
   </div>
   <script src="/admin/assets/admin.js"></script>
 </body>
