@@ -23,7 +23,24 @@ function shortKey(v) {
 }
 
 async function copyText(value) {
-  await navigator.clipboard.writeText(value);
+  if (navigator.clipboard && window.isSecureContext) {
+    await navigator.clipboard.writeText(value);
+    return;
+  }
+  const input = document.createElement('textarea');
+  input.value = value;
+  input.setAttribute('readonly', '');
+  input.style.position = 'fixed';
+  input.style.opacity = '0';
+  input.style.pointerEvents = 'none';
+  document.body.appendChild(input);
+  input.focus();
+  input.select();
+  const ok = document.execCommand('copy');
+  document.body.removeChild(input);
+  if (!ok) {
+    throw new Error('copy_failed');
+  }
 }
 
 function healthText(rate) {
@@ -142,7 +159,7 @@ async function copyKey(id) {
     await copyText(value);
     document.getElementById('key-msg').textContent = '已复制 Key';
   } catch (err) {
-    document.getElementById('key-msg').textContent = '复制失败，请检查浏览器权限';
+    document.getElementById('key-msg').textContent = '复制失败，请尝试使用 HTTPS、localhost，或手动长按复制';
   }
 }
 
