@@ -7,6 +7,8 @@ import json
 import logging
 import math
 import os
+from pathlib import Path
+import hashlib
 import re
 import secrets
 import string
@@ -19,7 +21,7 @@ import httpcore
 import httpx
 import uvicorn
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 
 from main import ZaiClient
 from claude_compat import (
@@ -57,12 +59,237 @@ if not HTTP_DEBUG:
 
 POOL_SIZE = int(os.getenv("POOL_SIZE", "3"))
 TOKEN_MAX_AGE = int(os.getenv("TOKEN_MAX_AGE", "480"))  # seconds
+REBUILD_COOLDOWN = int(os.getenv("REBUILD_COOLDOWN", "30"))
+REBUILD_MAX_RETRIES = int(os.getenv("REBUILD_MAX_RETRIES", "3"))
+STATE_FILE = Path(__file__).with_name("webui_state.json")
+ADMIN_DIR = Path(__file__).with_name("web")
+ADMIN_INDEX = ADMIN_DIR / "admin.html"
+ADMIN_CSS = ADMIN_DIR / "admin.css"
+ADMIN_JS = ADMIN_DIR / "admin.js"
+
+
+def _now_ts() -> float:
+    return time.time()
+
+
+def _iso_ts(ts: float | None) -> str | None:
+    if not ts:
+        return None
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+
+
+def _random_api_key(length: int = 32, prefix: str = "sk-zai-") -> str:
+    alphabet = string.ascii_letters + string.digits
+    return prefix + "".join(secrets.choice(alphabet) for _ in range(length))
+
+
+def _hash_password(password: str) -> str:
+    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+
+class APIKeyStore:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._lock = asyncio.Lock()
+        self._keys: list[dict[str, Any]] = []
+        self._target_pool_size = POOL_SIZE
+        self._rebuild_cooldown = REBUILD_COOLDOWN
+        self._rebuild_max_retries = REBUILD_MAX_RETRIES
+        self._admin_password_hash = _hash_password("zai2api")
+        self._admin_sessions: dict[str, float] = {}
+        self._load()
+
+    def _load(self) -> None:
+        if not self.path.exists():
+            return
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except Exception as e:
+            logger.warning("State load failed: %s", e)
+            return
+        keys = data.get("api_keys", [])
+        if isinstance(keys, list):
+            self._keys = [k for k in keys if isinstance(k, dict) and k.get("key")]
+        target = data.get("target_pool_size")
+        if isinstance(target, int) and target > 0:
+            self._target_pool_size = target
+        password_hash = data.get("admin_password_hash")
+        if isinstance(password_hash, str) and password_hash:
+            self._admin_password_hash = password_hash
+        rebuild_cooldown = data.get("rebuild_cooldown")
+        if isinstance(rebuild_cooldown, int) and rebuild_cooldown >= 0:
+            self._rebuild_cooldown = rebuild_cooldown
+        rebuild_max_retries = data.get("rebuild_max_retries")
+        if isinstance(rebuild_max_retries, int) and rebuild_max_retries > 0:
+            self._rebuild_max_retries = rebuild_max_retries
+
+    def _save_unlocked(self) -> None:
+        payload = {
+            "api_keys": self._keys,
+            "target_pool_size": self._target_pool_size,
+            "admin_password_hash": self._admin_password_hash,
+            "rebuild_cooldown": self._rebuild_cooldown,
+            "rebuild_max_retries": self._rebuild_max_retries,
+        }
+        self.path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    async def list_keys(self) -> list[dict[str, Any]]:
+        async with self._lock:
+            return [dict(item) for item in self._keys]
+
+    async def create_key(self, name: str, key: str | None = None) -> dict[str, Any]:
+        final_key = (key or _random_api_key()).strip()
+        if len(final_key) < 8:
+            raise ValueError("API Key 至少需要 8 个字符")
+        async with self._lock:
+            if any(item.get("key") == final_key for item in self._keys):
+                raise ValueError("API Key 已存在")
+            item = {
+                "id": f"key_{uuid.uuid4().hex[:12]}",
+                "name": name.strip() or "未命名 Key",
+                "key": final_key,
+                "created_at": _now_ts(),
+                "last_used_at": None,
+                "total_requests": 0,
+            }
+            self._keys.append(item)
+            self._save_unlocked()
+            return dict(item)
+
+    async def delete_key(self, key_id: str) -> bool:
+        async with self._lock:
+            for item in list(self._keys):
+                if item.get("id") == key_id:
+                    self._keys.remove(item)
+                    self._save_unlocked()
+                    return True
+        return False
+
+    async def record_key_use(self, raw_key: str) -> None:
+        async with self._lock:
+            for item in self._keys:
+                if secrets.compare_digest(str(item.get("key", "")), raw_key):
+                    item["total_requests"] = int(item.get("total_requests", 0)) + 1
+                    item["last_used_at"] = _now_ts()
+                    self._save_unlocked()
+                    return
+
+    async def validate(self, raw_key: str | None) -> bool:
+        if not raw_key:
+            return False
+        async with self._lock:
+            return any(
+                secrets.compare_digest(str(item.get("key", "")), raw_key)
+                for item in self._keys
+            )
+
+    async def has_keys(self) -> bool:
+        async with self._lock:
+            return bool(self._keys)
+
+    async def get_target_pool_size(self) -> int:
+        async with self._lock:
+            return self._target_pool_size
+
+    async def set_target_pool_size(self, size: int) -> None:
+        if size < 1:
+            raise ValueError("账号数量至少为 1")
+        async with self._lock:
+            self._target_pool_size = size
+            self._save_unlocked()
+
+    async def verify_admin_password(self, password: str) -> bool:
+        async with self._lock:
+            return secrets.compare_digest(
+                self._admin_password_hash, _hash_password(password)
+            )
+
+    async def change_admin_password(
+        self, current_password: str, new_password: str
+    ) -> None:
+        if len(new_password) < 6:
+            raise ValueError("新密码至少需要 6 个字符")
+        async with self._lock:
+            if not secrets.compare_digest(
+                self._admin_password_hash, _hash_password(current_password)
+            ):
+                raise ValueError("当前密码不正确")
+            self._admin_password_hash = _hash_password(new_password)
+            self._admin_sessions.clear()
+            self._save_unlocked()
+
+    async def create_admin_session(self) -> str:
+        async with self._lock:
+            token = secrets.token_urlsafe(32)
+            self._admin_sessions[token] = _now_ts() + 7 * 24 * 3600
+            return token
+
+    async def is_valid_admin_session(self, token: str | None) -> bool:
+        if not token:
+            return False
+        async with self._lock:
+            expires_at = self._admin_sessions.get(token)
+            if not expires_at:
+                return False
+            if expires_at < _now_ts():
+                self._admin_sessions.pop(token, None)
+                return False
+            self._admin_sessions[token] = _now_ts() + 7 * 24 * 3600
+            return True
+
+    async def clear_admin_session(self, token: str | None) -> None:
+        if not token:
+            return
+        async with self._lock:
+            self._admin_sessions.pop(token, None)
+
+    async def get_rebuild_settings(self) -> dict[str, int]:
+        async with self._lock:
+            return {
+                "rebuild_cooldown": self._rebuild_cooldown,
+                "rebuild_max_retries": self._rebuild_max_retries,
+            }
+
+    async def update_rebuild_settings(
+        self, rebuild_cooldown: int, rebuild_max_retries: int
+    ) -> dict[str, int]:
+        if rebuild_cooldown < 0:
+            raise ValueError("冷却时间不能小于 0")
+        if rebuild_max_retries < 1:
+            raise ValueError("重试上限至少为 1")
+        async with self._lock:
+            self._rebuild_cooldown = rebuild_cooldown
+            self._rebuild_max_retries = rebuild_max_retries
+            self._save_unlocked()
+            return {
+                "rebuild_cooldown": self._rebuild_cooldown,
+                "rebuild_max_retries": self._rebuild_max_retries,
+            }
+
+
+key_store = APIKeyStore(STATE_FILE)
 
 
 class AccountInfo:
     """A single guest auth session."""
 
-    __slots__ = ("token", "user_id", "username", "created_at", "active", "valid")
+    __slots__ = (
+        "token",
+        "user_id",
+        "username",
+        "created_at",
+        "active",
+        "valid",
+        "request_count",
+        "success_count",
+        "failure_count",
+        "last_used_at",
+        "last_success_at",
+        "last_error",
+    )
 
     def __init__(self, token: str, user_id: str, username: str) -> None:
         self.token = token
@@ -71,9 +298,34 @@ class AccountInfo:
         self.created_at = time.time()
         self.active = 0  # number of in-flight requests
         self.valid = True
+        self.request_count = 0
+        self.success_count = 0
+        self.failure_count = 0
+        self.last_used_at: float | None = None
+        self.last_success_at: float | None = None
+        self.last_error = ""
 
     def snapshot(self) -> dict[str, str]:
         return {"token": self.token, "user_id": self.user_id, "username": self.username}
+
+    def stats(self) -> dict[str, Any]:
+        return {
+            "user_id": self.user_id,
+            "username": self.username,
+            "created_at": _iso_ts(self.created_at),
+            "age_seconds": round(self.age, 1),
+            "active": self.active,
+            "valid": self.valid,
+            "request_count": self.request_count,
+            "success_count": self.success_count,
+            "failure_count": self.failure_count,
+            "success_rate": round((self.success_count / self.request_count) * 100, 1)
+            if self.request_count
+            else 0.0,
+            "last_used_at": _iso_ts(self.last_used_at),
+            "last_success_at": _iso_ts(self.last_success_at),
+            "last_error": self.last_error,
+        }
 
     @property
     def age(self) -> float:
@@ -87,6 +339,12 @@ class SessionPool:
         self._lock = asyncio.Lock()
         self._accounts: list[AccountInfo] = []
         self._bg_task: asyncio.Task | None = None
+        self._target_size = POOL_SIZE
+        self._rr_cursor = 0
+        self._rebuild_attempts: dict[str, list[float]] = {}
+        self._last_rebuild_at = 0.0
+        self._rebuild_cooldown = REBUILD_COOLDOWN
+        self._rebuild_max_retries = REBUILD_MAX_RETRIES
 
     # ── internal ─────────────────────────────────────────────────────
 
@@ -127,7 +385,9 @@ class SessionPool:
                     for a in dead:
                         self._accounts.remove(a)
                         asyncio.create_task(self._del_account(a))
-                    need = POOL_SIZE - len([a for a in self._accounts if a.valid])
+                    need = self._target_size - len(
+                        [a for a in self._accounts if a.valid]
+                    )
                     for _ in range(max(0, need)):
                         try:
                             self._accounts.append(await self._new_account())
@@ -138,12 +398,40 @@ class SessionPool:
             except Exception:
                 pass
 
+    def _pick_account(self, accounts: list[AccountInfo]) -> AccountInfo:
+        min_active = min(a.active for a in accounts)
+        candidates = [a for a in accounts if a.active == min_active]
+        if len(candidates) == 1:
+            return candidates[0]
+        start = self._rr_cursor % len(candidates)
+        chosen = candidates[start]
+        self._rr_cursor = (self._rr_cursor + 1) % max(len(candidates), 1)
+        return chosen
+
+    def _can_rebuild_now(self, failed_user_id: str | None = None) -> bool:
+        now = _now_ts()
+        if now - self._last_rebuild_at < self._rebuild_cooldown:
+            return False
+        key = failed_user_id or "global"
+        attempts = [ts for ts in self._rebuild_attempts.get(key, []) if now - ts < 300]
+        self._rebuild_attempts[key] = attempts
+        if len(attempts) >= self._rebuild_max_retries:
+            return False
+        attempts.append(now)
+        self._rebuild_attempts[key] = attempts
+        self._last_rebuild_at = now
+        return True
+
     # ── public API ───────────────────────────────────────────────────
 
     async def initialize(self) -> None:
+        self._target_size = await key_store.get_target_pool_size()
+        rebuild_settings = await key_store.get_rebuild_settings()
+        self._rebuild_cooldown = rebuild_settings["rebuild_cooldown"]
+        self._rebuild_max_retries = rebuild_settings["rebuild_max_retries"]
         async with self._lock:
             results = await asyncio.gather(
-                *[self._new_account() for _ in range(POOL_SIZE)],
+                *[self._new_account() for _ in range(self._target_size)],
                 return_exceptions=True,
             )
             for r in results:
@@ -173,8 +461,10 @@ class SessionPool:
                     acc = await self._new_account()
                     self._accounts.append(acc)
                     good = [acc]
-        acc = min(good, key=lambda a: a.active)
+        acc = self._pick_account(good)
         acc.active += 1
+        acc.request_count += 1
+        acc.last_used_at = _now_ts()
         return acc
 
     def release(self, acc: AccountInfo) -> None:
@@ -182,6 +472,7 @@ class SessionPool:
 
     async def report_failure(self, acc: AccountInfo) -> None:
         """Mark account invalid, schedule cleanup, add replacement."""
+        acc.failure_count += 1
         acc.valid = False
         asyncio.create_task(self._del_account(acc))
         try:
@@ -212,6 +503,26 @@ class SessionPool:
                 if not good:
                     self._accounts.append(await self._new_account())
 
+    def mark_success(self, user_id: str) -> None:
+        for a in self._accounts:
+            if a.user_id == user_id:
+                a.success_count += 1
+                a.last_success_at = _now_ts()
+                a.last_error = ""
+                return
+
+    async def mark_failure(self, user_id: str, error: str) -> None:
+        found = False
+        for a in self._accounts:
+            if a.user_id == user_id:
+                a.failure_count += 1
+                a.last_error = error[:240]
+                a.valid = False
+                found = True
+                break
+        if found:
+            await self.refresh_auth(user_id)
+
     def get_auth_snapshot(self) -> dict[str, str]:
         """Get auth snapshot from the least-busy valid account."""
         good = [a for a in self._accounts if a.valid and a.age < TOKEN_MAX_AGE]
@@ -219,8 +530,10 @@ class SessionPool:
             good = [a for a in self._accounts if a.valid]
         if not good:
             raise RuntimeError("No valid accounts in pool")
-        acc = min(good, key=lambda a: a.active)
+        acc = self._pick_account(good)
         acc.active += 1
+        acc.request_count += 1
+        acc.last_used_at = _now_ts()
         return acc.snapshot()
 
     def _release_by_user_id(self, user_id: str) -> None:
@@ -242,6 +555,14 @@ class SessionPool:
                         "SessionPool: invalidated failed account uid=%s", failed_user_id
                     )
                     break
+        if not self._can_rebuild_now(failed_user_id):
+            logger.warning(
+                "SessionPool: rebuild skipped due to cooldown/retry cap uid=%s cooldown=%ss max=%d",
+                failed_user_id,
+                self._rebuild_cooldown,
+                self._rebuild_max_retries,
+            )
+            return
         try:
             acc = await self._new_account()
             async with self._lock:
@@ -249,6 +570,16 @@ class SessionPool:
             logger.info("SessionPool: auth refreshed, new user_id=%s", acc.user_id)
         except Exception as e:
             logger.warning("SessionPool: refresh_auth failed: %s", e)
+
+    async def update_rebuild_settings(
+        self, rebuild_cooldown: int, rebuild_max_retries: int
+    ) -> dict[str, int]:
+        settings = await key_store.update_rebuild_settings(
+            rebuild_cooldown, rebuild_max_retries
+        )
+        self._rebuild_cooldown = settings["rebuild_cooldown"]
+        self._rebuild_max_retries = settings["rebuild_max_retries"]
+        return settings
 
     async def cleanup_chats(self) -> None:
         """Clean up chats for idle accounts to free concurrency slots."""
@@ -261,6 +592,64 @@ class SessionPool:
                     await c.close()
                 except Exception:
                     pass
+
+    async def set_target_size(self, size: int) -> None:
+        if size < 1:
+            raise ValueError("账号数量至少为 1")
+        self._target_size = size
+        await key_store.set_target_pool_size(size)
+        async with self._lock:
+            valid_accounts = [a for a in self._accounts if a.valid]
+            need = size - len(valid_accounts)
+            if need > 0:
+                for _ in range(need):
+                    self._accounts.append(await self._new_account())
+            elif need < 0:
+                removable = [a for a in self._accounts if a.active == 0]
+                for acc in removable[:-need]:
+                    if acc in self._accounts:
+                        self._accounts.remove(acc)
+                        asyncio.create_task(self._del_account(acc))
+
+    async def add_account(self) -> dict[str, Any]:
+        async with self._lock:
+            acc = await self._new_account()
+            self._accounts.append(acc)
+            self._target_size += 1
+            await key_store.set_target_pool_size(self._target_size)
+            return acc.stats()
+
+    async def remove_account(self, user_id: str) -> bool:
+        async with self._lock:
+            for acc in list(self._accounts):
+                if acc.user_id == user_id and acc.active == 0:
+                    self._accounts.remove(acc)
+                    self._target_size = max(1, self._target_size - 1)
+                    await key_store.set_target_pool_size(self._target_size)
+                    asyncio.create_task(self._del_account(acc))
+                    return True
+        return False
+
+    def dashboard(self) -> dict[str, Any]:
+        accounts = [a.stats() for a in self._accounts]
+        total_requests = sum(a["request_count"] for a in accounts)
+        total_success = sum(a["success_count"] for a in accounts)
+        total_failures = sum(a["failure_count"] for a in accounts)
+        return {
+            "target_pool_size": self._target_size,
+            "current_pool_size": len(self._accounts),
+            "valid_accounts": sum(1 for a in self._accounts if a.valid),
+            "active_requests": sum(a.active for a in self._accounts),
+            "total_requests": total_requests,
+            "total_success": total_success,
+            "total_failures": total_failures,
+            "success_rate": round((total_success / total_requests) * 100, 1)
+            if total_requests
+            else 0.0,
+            "rebuild_cooldown": self._rebuild_cooldown,
+            "rebuild_max_retries": self._rebuild_max_retries,
+            "accounts": accounts,
+        }
 
 
 pool = SessionPool()
@@ -428,9 +817,13 @@ def _preprocess_messages(messages: list[dict]) -> list[dict]:
         if role == "tool":
             tc_id = msg.get("tool_call_id")
             content = _extract_text_from_content(msg.get("content", ""))
-            info = tool_idx.get(
-                tc_id, {"name": msg.get("name", "unknown_tool"), "arguments": "{}"}
+            info = (
+                tool_idx.get(str(tc_id))
+                if isinstance(tc_id, str)
+                else {"name": msg.get("name", "unknown_tool"), "arguments": "{}"}
             )
+            if not isinstance(info, dict):
+                info = {"name": msg.get("name", "unknown_tool"), "arguments": "{}"}
             out.append(
                 {
                     "role": "user",
@@ -682,8 +1075,10 @@ def _extract_upstream_tool_calls(data: dict) -> list[dict]:
     choices = data.get("choices")
     if isinstance(choices, list) and choices:
         c0 = choices[0] if isinstance(choices[0], dict) else {}
-        delta = c0.get("delta") if isinstance(c0.get("delta"), dict) else {}
-        message = c0.get("message") if isinstance(c0.get("message"), dict) else {}
+        delta_raw = c0.get("delta")
+        message_raw = c0.get("message")
+        delta: dict[str, Any] = delta_raw if isinstance(delta_raw, dict) else {}
+        message: dict[str, Any] = message_raw if isinstance(message_raw, dict) else {}
         for candidate in (delta.get("tool_calls"), message.get("tool_calls")):
             if isinstance(candidate, list):
                 return candidate
@@ -699,8 +1094,10 @@ def _extract_upstream_delta(data: dict) -> tuple[str, str]:
     choices = data.get("choices")
     if isinstance(choices, list) and choices:
         c0 = choices[0] if isinstance(choices[0], dict) else {}
-        delta_obj = c0.get("delta") if isinstance(c0.get("delta"), dict) else {}
-        msg_obj = c0.get("message") if isinstance(c0.get("message"), dict) else {}
+        delta_raw = c0.get("delta")
+        message_raw = c0.get("message")
+        delta_obj: dict[str, Any] = delta_raw if isinstance(delta_raw, dict) else {}
+        msg_obj: dict[str, Any] = message_raw if isinstance(message_raw, dict) else {}
         if not phase:
             phase = str(c0.get("phase", "") or "")
         for v in (
@@ -728,11 +1125,303 @@ def _extract_upstream_delta(data: dict) -> tuple[str, str]:
     return phase, ""
 
 
+async def _extract_bearer_key(request: Request) -> str | None:
+    header = request.headers.get("authorization", "")
+    if not header.lower().startswith("bearer "):
+        return None
+    return header[7:].strip() or None
+
+
+async def _ensure_request_allowed(request: Request) -> str | None:
+    has_keys = await key_store.has_keys()
+    if not has_keys:
+        return None
+    raw_key = await _extract_bearer_key(request)
+    if raw_key and await key_store.validate(raw_key):
+        await key_store.record_key_use(raw_key)
+        return raw_key
+    return None
+
+
+async def _admin_authed(request: Request) -> bool:
+    return await key_store.is_valid_admin_session(request.cookies.get("admin_session"))
+
+
+def _admin_auth_failed() -> JSONResponse:
+    return JSONResponse(status_code=401, content={"message": "Admin auth required"})
+
+
+def _unauthorized_response() -> JSONResponse:
+    return JSONResponse(
+        status_code=401,
+        content={
+            "error": {
+                "message": "Invalid or missing API key",
+                "type": "authentication_error",
+            }
+        },
+    )
+
+
+def _read_admin_asset(path: Path, fallback: str) -> str:
+    if path.exists():
+        return path.read_text(encoding="utf-8")
+    return fallback
+
+
+ADMIN_HTML_FALLBACK = """<!DOCTYPE html>
+<html lang=\"zh-CN\">
+<head>
+  <meta charset=\"UTF-8\" />
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />
+  <title>zai2api</title>
+  <link rel=\"stylesheet\" href=\"/admin/assets/admin.css\" />
+</head>
+<body>
+  <div class=\"shell\">
+    <section class=\"hero\">
+      <div class=\"badge\">zai2api</div>
+      <h1>zai2api</h1>
+      <div class=\"sub\">Google AI Studio 气质 + 二次元糖霜感，实时监控账号、成功率、Key、健康度与最近趋势。</div>
+    </section>
+
+    <section class=\"grid stats\" id=\"stats\"></section>
+
+    <section class=\"grid trend-grid\">
+      <div class=\"card\">
+        <div class=\"section-head\"><strong>实时健康度</strong><span id=\"health-text\" class=\"hint\">载入中...</span></div>
+        <div class=\"health-bar\"><div id=\"health-fill\" class=\"health-fill\"></div></div>
+        <div id=\"health-meta\" class=\"hint\"></div>
+      </div>
+      <div class=\"card\">
+        <div class=\"section-head\"><strong>最近 20 次快照</strong><span class=\"hint\">自动刷新</span></div>
+        <canvas id=\"trend-canvas\" width=\"640\" height=\"220\"></canvas>
+      </div>
+    </section>
+
+    <section class=\"grid two\">
+      <div class=\"card\">
+        <div class=\"section-head\"><strong>账号池监控</strong><button class=\"ghost\" onclick=\"loadDashboard()\">刷新</button></div>
+        <div class=\"row\" style=\"margin-bottom:12px;\"><button onclick=\"addAccount()\">+ 增加账号</button></div>
+        <table>
+          <thead><tr><th>账号</th><th>状态</th><th>调用</th><th>成功</th><th>失败</th><th>成功率</th><th>最近状态</th><th>操作</th></tr></thead>
+          <tbody id=\"accounts\"></tbody>
+        </table>
+      </div>
+
+      <div class=\"card\">
+        <strong>API Key 管理</strong>
+        <div class=\"hint\" style=\"margin:8px 0 14px;\">支持随机生成，也支持你自己填自定义 Key。</div>
+        <form id=\"key-form\">
+          <input name=\"name\" placeholder=\"Key 名称，例如 面板A / 本地脚本\" />
+          <input name=\"key\" placeholder=\"留空则随机生成，自定义示例：sk-my-custom-key\" />
+          <button type=\"submit\">创建 Key</button>
+        </form>
+        <div class=\"msg\" id=\"key-msg\"></div>
+        <table>
+          <thead><tr><th>名称</th><th>Key</th><th>调用数</th><th>最近使用</th><th>操作</th></tr></thead>
+          <tbody id=\"keys\"></tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+  <script src=\"/admin/assets/admin.js\"></script>
+</body>
+</html>"""
+
+
+ADMIN_CSS_FALLBACK = """:root {
+  --bg: #fff7fb;
+  --bg2: #eef6ff;
+  --panel: rgba(255,255,255,.82);
+  --line: rgba(80, 100, 140, .16);
+  --text: #25324a;
+  --muted: #6f7c97;
+  --accent: #ff7aa2;
+  --accent2: #73b7ff;
+  --good: #1fa971;
+  --bad: #e05b75;
+  --warn: #f4a340;
+  --shadow: 0 20px 60px rgba(101, 119, 164, .18);
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
+  color: var(--text);
+  background: radial-gradient(circle at top left, rgba(255,122,162,.22), transparent 30%), radial-gradient(circle at top right, rgba(115,183,255,.20), transparent 28%), linear-gradient(135deg, var(--bg), var(--bg2));
+  min-height: 100vh;
+}
+.shell { max-width: 1320px; margin: 0 auto; padding: 28px; }
+.hero, .card { background: var(--panel); border: 1px solid var(--line); backdrop-filter: blur(20px); border-radius: 28px; box-shadow: var(--shadow); }
+.hero { padding: 28px; position: relative; overflow: hidden; }
+.hero::after { content: ""; position: absolute; inset: auto -80px -80px auto; width: 240px; height: 240px; background: radial-gradient(circle, rgba(255,122,162,.28), transparent 70%); }
+.badge { display: inline-flex; padding: 8px 12px; border-radius: 999px; background: rgba(255,255,255,.6); color: #d75f86; font-size: 12px; letter-spacing: .12em; text-transform: uppercase; }
+h1 { margin: 12px 0 0; font-size: 34px; }
+.sub { color: var(--muted); margin-top: 10px; }
+.grid { display: grid; gap: 18px; margin-top: 20px; }
+.stats { grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
+.trend-grid { grid-template-columns: .8fr 1.2fr; }
+.two { grid-template-columns: 1.2fr .8fr; }
+.card { padding: 20px; }
+.stat-num { font-size: 30px; font-weight: 800; margin-top: 8px; }
+.label { color: var(--muted); font-size: 13px; letter-spacing: .08em; text-transform: uppercase; }
+.section-head { display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom: 12px; }
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 12px 10px; border-bottom: 1px solid var(--line); font-size: 14px; vertical-align: top; }
+th { color: var(--muted); font-weight: 600; }
+.pill { display: inline-block; padding: 6px 10px; border-radius: 999px; font-size: 12px; font-weight: 700; }
+.ok { background: rgba(31,169,113,.12); color: var(--good); }
+.bad { background: rgba(224,91,117,.12); color: var(--bad); }
+.busy { background: rgba(115,183,255,.15); color: #3375bf; }
+.warn { background: rgba(244,163,64,.15); color: #b87317; }
+form { display: grid; gap: 12px; }
+input { width: 100%; padding: 14px 16px; border-radius: 16px; border: 1px solid var(--line); background: rgba(255,255,255,.86); color: var(--text); outline: none; }
+button { border: 0; border-radius: 16px; padding: 12px 16px; cursor: pointer; font-weight: 700; background: linear-gradient(135deg, var(--accent), var(--accent2)); color: white; }
+button.ghost { background: rgba(37,50,74,.08); color: var(--text); }
+button:disabled { opacity: .5; cursor: not-allowed; }
+.row { display: flex; gap: 10px; flex-wrap: wrap; }
+.hint, .msg { color: var(--muted); font-size: 13px; }
+.msg { min-height: 20px; margin-top: 8px; }
+.health-bar { width: 100%; height: 16px; background: rgba(37,50,74,.08); border-radius: 999px; overflow: hidden; margin: 14px 0 10px; }
+.health-fill { height: 100%; border-radius: 999px; background: linear-gradient(90deg, var(--bad), var(--warn), var(--good)); width: 0%; transition: width .35s ease; }
+canvas { width: 100%; height: 220px; display: block; background: linear-gradient(180deg, rgba(255,255,255,.7), rgba(255,255,255,.38)); border-radius: 18px; }
+@media (max-width: 960px) { .two, .trend-grid { grid-template-columns: 1fr; } .shell { padding: 16px; } }
+"""
+
+
+ADMIN_JS_FALLBACK = """const historyPoints = [];
+
+async function api(url, options = {}) {
+  const res = await fetch(url, { headers: { 'Content-Type': 'application/json' }, ...options });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.detail || data.error?.message || data.message || '请求失败');
+  return data;
+}
+
+function card(label, value, extra = '') {
+  return `<div class=\"card\"><div class=\"label\">${label}</div><div class=\"stat-num\">${value}</div><div class=\"hint\">${extra}</div></div>`;
+}
+
+function shortKey(v) {
+  return v.length > 20 ? `${v.slice(0, 10)}...${v.slice(-6)}` : v;
+}
+
+function healthText(rate) {
+  if (rate >= 95) return '状态超稳';
+  if (rate >= 80) return '状态良好';
+  if (rate >= 60) return '有点波动';
+  return '需要关注';
+}
+
+function drawTrend() {
+  const canvas = document.getElementById('trend-canvas');
+  const ctx = canvas.getContext('2d');
+  const width = canvas.width;
+  const height = canvas.height;
+  ctx.clearRect(0, 0, width, height);
+  ctx.strokeStyle = 'rgba(111,124,151,.18)';
+  ctx.lineWidth = 1;
+  for (let i = 1; i <= 4; i++) {
+    const y = (height / 5) * i;
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(width, y); ctx.stroke();
+  }
+  if (historyPoints.length < 2) return;
+  const maxVal = Math.max(...historyPoints.map(v => Math.max(v.requests, v.success)), 1);
+  const drawLine = (color, selector) => {
+    ctx.beginPath();
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = color;
+    historyPoints.forEach((point, index) => {
+      const x = (width / Math.max(historyPoints.length - 1, 1)) * index;
+      const y = height - (selector(point) / maxVal) * (height - 18) - 9;
+      if (index === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+  };
+  drawLine('#73b7ff', p => p.requests);
+  drawLine('#ff7aa2', p => p.success);
+}
+
+function pushHistory(data) {
+  historyPoints.push({ time: Date.now(), requests: data.total_requests, success: data.total_success });
+  if (historyPoints.length > 20) historyPoints.shift();
+  drawTrend();
+}
+
+async function loadDashboard() {
+  const data = await api('/admin/api/dashboard');
+  document.getElementById('stats').innerHTML = [
+    card('有效账号', data.valid_accounts, `目标 ${data.target_pool_size}`),
+    card('活跃请求', data.active_requests, `当前池 ${data.current_pool_size}`),
+    card('总调用', data.total_requests, '所有 free 账号累计'),
+    card('总成功', data.total_success, `成功率 ${data.success_rate}%`),
+    card('总失败', data.total_failures, `Key ${data.api_key_count} 个`),
+  ].join('');
+
+  const health = Math.max(0, Math.min(100, data.success_rate));
+  document.getElementById('health-fill').style.width = `${health}%`;
+  document.getElementById('health-text').textContent = `${healthText(health)} · ${health}%`;
+  document.getElementById('health-meta').textContent = `当前 ${data.active_requests} 个活跃请求，${data.valid_accounts}/${data.current_pool_size} 个账号可用。`;
+
+  document.getElementById('accounts').innerHTML = data.accounts.map(acc => `
+    <tr>
+      <td><div><strong>${acc.username || 'Guest'}</strong></div><div class=\"hint\">${acc.user_id}</div></td>
+      <td><span class=\"pill ${acc.valid ? 'ok' : 'bad'}\">${acc.valid ? '正常' : '失效'}</span> <span class=\"pill busy\">并发 ${acc.active}</span></td>
+      <td>${acc.request_count}</td>
+      <td>${acc.success_count}</td>
+      <td>${acc.failure_count}</td>
+      <td><span class=\"pill ${acc.success_rate >= 80 ? 'ok' : acc.success_rate >= 50 ? 'warn' : 'bad'}\">${acc.success_rate}%</span></td>
+      <td><div>${acc.last_success_at || '暂无'}</div><div class=\"hint\">${acc.last_error || '无错误'}</div></td>
+      <td><button class=\"ghost\" ${acc.active > 0 ? 'disabled' : ''} onclick=\"removeAccount('${acc.user_id}')\">移除</button></td>
+    </tr>`).join('');
+
+  const keys = await api('/admin/api/keys');
+  document.getElementById('keys').innerHTML = keys.data.map(item => `
+    <tr>
+      <td>${item.name}</td>
+      <td title=\"${item.key}\">${shortKey(item.key)}</td>
+      <td>${item.total_requests}</td>
+      <td>${item.last_used_at || '暂无'}</td>
+      <td><button class=\"ghost\" onclick=\"deleteKey('${item.id}')\">删除</button></td>
+    </tr>`).join('');
+
+  pushHistory(data);
+}
+
+async function addAccount() { await api('/admin/api/accounts', { method: 'POST', body: '{}' }); loadDashboard(); }
+async function removeAccount(userId) { await api(`/admin/api/accounts/${userId}`, { method: 'DELETE' }); loadDashboard(); }
+async function deleteKey(id) { await api(`/admin/api/keys/${id}`, { method: 'DELETE' }); loadDashboard(); }
+
+document.addEventListener('DOMContentLoaded', () => {
+  document.getElementById('key-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    const payload = { name: fd.get('name') || '', key: fd.get('key') || '' };
+    try {
+      const res = await api('/admin/api/keys', { method: 'POST', body: JSON.stringify(payload) });
+      document.getElementById('key-msg').textContent = `已创建: ${res.key}`;
+      e.target.reset();
+      loadDashboard();
+    } catch (err) {
+      document.getElementById('key-msg').textContent = err.message;
+    }
+  });
+  loadDashboard();
+  setInterval(loadDashboard, 8000);
+});
+"""
+
+
 # ── Endpoints ────────────────────────────────────────────────────────
 
 
 @app.get("/v1/models")
-async def list_models():
+async def list_models(request: Request):
+    if await key_store.has_keys():
+        allowed_key = await _ensure_request_allowed(request)
+        if not allowed_key:
+            return _unauthorized_response()
     models_resp = await pool.get_models()
     if isinstance(models_resp, dict) and "data" in models_resp:
         models_list = models_resp["data"]
@@ -753,8 +1442,169 @@ async def list_models():
     }
 
 
+@app.get("/admin", response_class=HTMLResponse)
+async def admin_page(request: Request):
+    if not await _admin_authed(request):
+        return HTMLResponse(_read_admin_asset(ADMIN_INDEX, ADMIN_HTML_FALLBACK))
+    return HTMLResponse(_read_admin_asset(ADMIN_INDEX, ADMIN_HTML_FALLBACK))
+
+
+@app.get("/admin/assets/admin.css")
+async def admin_css():
+    return Response(
+        content=_read_admin_asset(ADMIN_CSS, ADMIN_CSS_FALLBACK),
+        media_type="text/css",
+    )
+
+
+@app.get("/admin/assets/admin.js")
+async def admin_js():
+    return Response(
+        content=_read_admin_asset(ADMIN_JS, ADMIN_JS_FALLBACK),
+        media_type="application/javascript",
+    )
+
+
+@app.post("/admin/api/login")
+async def admin_login(request: Request):
+    body = await request.json()
+    password = str(body.get("password", "") or "")
+    if not await key_store.verify_admin_password(password):
+        return JSONResponse(status_code=401, content={"message": "密码错误"})
+    token = await key_store.create_admin_session()
+    response = JSONResponse({"ok": True})
+    response.set_cookie(
+        key="admin_session",
+        value=token,
+        httponly=True,
+        samesite="lax",
+        max_age=7 * 24 * 3600,
+    )
+    return response
+
+
+@app.post("/admin/api/logout")
+async def admin_logout(request: Request):
+    await key_store.clear_admin_session(request.cookies.get("admin_session"))
+    response = JSONResponse({"ok": True})
+    response.delete_cookie("admin_session")
+    return response
+
+
+@app.post("/admin/api/change-password")
+async def admin_change_password(request: Request):
+    if not await _admin_authed(request):
+        return _admin_auth_failed()
+    body = await request.json()
+    try:
+        await key_store.change_admin_password(
+            str(body.get("current_password", "") or ""),
+            str(body.get("new_password", "") or ""),
+        )
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"message": str(e)})
+    response = JSONResponse({"ok": True, "message": "密码已更新，请重新登录"})
+    response.delete_cookie("admin_session")
+    return response
+
+
+@app.post("/admin/api/rebuild-settings")
+async def admin_update_rebuild_settings(request: Request):
+    if not await _admin_authed(request):
+        return _admin_auth_failed()
+    body = await request.json()
+    try:
+        settings = await pool.update_rebuild_settings(
+            int(body.get("rebuild_cooldown", 0)),
+            int(body.get("rebuild_max_retries", 1)),
+        )
+    except (ValueError, TypeError) as e:
+        return JSONResponse(status_code=400, content={"message": str(e)})
+    return {"ok": True, **settings}
+
+
+@app.get("/admin/api/dashboard")
+async def admin_dashboard(request: Request):
+    if not await _admin_authed(request):
+        return _admin_auth_failed()
+    data = pool.dashboard()
+    keys = await key_store.list_keys()
+    data["api_key_count"] = len(keys)
+    return data
+
+
+@app.get("/admin/api/keys")
+async def admin_list_keys(request: Request):
+    if not await _admin_authed(request):
+        return _admin_auth_failed()
+    keys = await key_store.list_keys()
+    return {
+        "data": [
+            {
+                **item,
+                "created_at": _iso_ts(item.get("created_at")),
+                "last_used_at": _iso_ts(item.get("last_used_at")),
+            }
+            for item in keys
+        ]
+    }
+
+
+@app.post("/admin/api/keys")
+async def admin_create_key(request: Request):
+    if not await _admin_authed(request):
+        return _admin_auth_failed()
+    body = await request.json()
+    try:
+        item = await key_store.create_key(
+            str(body.get("name", "") or ""),
+            str(body.get("key", "") or "").strip() or None,
+        )
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"message": str(e)})
+    return {
+        **item,
+        "created_at": _iso_ts(item.get("created_at")),
+        "last_used_at": _iso_ts(item.get("last_used_at")),
+    }
+
+
+@app.delete("/admin/api/keys/{key_id}")
+async def admin_delete_key(key_id: str, request: Request):
+    if not await _admin_authed(request):
+        return _admin_auth_failed()
+    if await key_store.delete_key(key_id):
+        return {"ok": True}
+    return JSONResponse(status_code=404, content={"message": "Key 不存在"})
+
+
+@app.post("/admin/api/accounts")
+async def admin_add_account(request: Request):
+    if not await _admin_authed(request):
+        return _admin_auth_failed()
+    account = await pool.add_account()
+    return {"ok": True, "account": account}
+
+
+@app.delete("/admin/api/accounts/{user_id}")
+async def admin_remove_account(user_id: str, request: Request):
+    if not await _admin_authed(request):
+        return _admin_auth_failed()
+    removed = await pool.remove_account(user_id)
+    if removed:
+        return {"ok": True}
+    return JSONResponse(
+        status_code=400,
+        content={"message": "账号不存在，或当前仍有活跃请求无法移除"},
+    )
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
+    if await key_store.has_keys():
+        allowed_key = await _ensure_request_allowed(request)
+        if not allowed_key:
+            return _unauthorized_response()
     body = await request.json()
 
     requested_model: str = body.get("model", "glm-5")
@@ -972,10 +1822,14 @@ async def chat_completions(request: Request):
 
                     finish = _openai_chunk(completion_id, model, finish_reason="stop")
                     yield f"data: {json.dumps(finish, ensure_ascii=False)}\n\n"
+                    if current_uid:
+                        pool.mark_success(current_uid)
                     yield "data: [DONE]\n\n"
                     return
 
                 except (httpcore.RemoteProtocolError, httpx.RemoteProtocolError) as e:
+                    if current_uid:
+                        await pool.mark_failure(current_uid, str(e))
                     logger.error(
                         "[stream][%s] server disconnected: %s", completion_id, e
                     )
@@ -994,10 +1848,12 @@ async def chat_completions(request: Request):
                     logger.info(
                         "[stream][%s] switching account and retrying...", completion_id
                     )
-                    await pool.refresh_auth(current_uid)
+
                     current_uid = None
                     continue
                 except (httpcore.ReadTimeout, httpx.ReadTimeout) as e:
+                    if current_uid:
+                        await pool.mark_failure(current_uid, str(e))
                     logger.error("[stream][%s] read timeout: %s", completion_id, e)
                     if client is not None:
                         if chat_id:
@@ -1014,10 +1870,12 @@ async def chat_completions(request: Request):
 
                     retried = True
                     logger.info("[stream][%s] retrying after timeout...", completion_id)
-                    await pool.refresh_auth(current_uid)
+
                     current_uid = None
                     continue
                 except httpx.HTTPStatusError as e:
+                    if current_uid:
+                        await pool.mark_failure(current_uid, str(e))
                     # Handle upstream 400 with concurrency limit (code 429)
                     is_concurrency = False
                     try:
@@ -1052,10 +1910,12 @@ async def chat_completions(request: Request):
                         )
                         await pool.cleanup_chats()
                         await asyncio.sleep(1)
-                    await pool.refresh_auth(current_uid)
+
                     current_uid = None
                     continue
                 except Exception as e:
+                    if current_uid:
+                        await pool.mark_failure(current_uid, str(e))
                     logger.exception("[stream][%s] exception: %s", completion_id, e)
                     if client is not None:
                         if chat_id:
@@ -1072,7 +1932,7 @@ async def chat_completions(request: Request):
                     logger.info(
                         "[stream][%s] refreshing auth and retrying...", completion_id
                     )
-                    await pool.refresh_auth(current_uid)
+
                     current_uid = None
                     continue
                 finally:
@@ -1141,6 +2001,8 @@ async def chat_completions(request: Request):
                 if reasoning_parts:
                     message["reasoning_content"] = "".join(reasoning_parts)
                 usage = _build_usage(usage_prompt_text, "".join(reasoning_parts))
+                if current_uid:
+                    pool.mark_success(current_uid)
                 return {
                     "id": completion_id,
                     "object": "chat.completion",
@@ -1175,6 +2037,8 @@ async def chat_completions(request: Request):
                 usage = _build_usage(
                     usage_prompt_text, (prefix_text or "") + "".join(reasoning_parts)
                 )
+                if current_uid:
+                    pool.mark_success(current_uid)
                 return {
                     "id": completion_id,
                     "object": "chat.completion",
@@ -1192,6 +2056,8 @@ async def chat_completions(request: Request):
             msg: dict = {"role": "assistant", "content": answer_text}
             if reasoning_parts:
                 msg["reasoning_content"] = "".join(reasoning_parts)
+            if current_uid:
+                pool.mark_success(current_uid)
             return {
                 "id": completion_id,
                 "object": "chat.completion",
@@ -1202,6 +2068,8 @@ async def chat_completions(request: Request):
             }
 
         except httpx.HTTPStatusError as e:
+            if current_uid:
+                await pool.mark_failure(current_uid, str(e))
             is_concurrency = False
             try:
                 err_body = e.response.json() if e.response else {}
@@ -1225,7 +2093,7 @@ async def chat_completions(request: Request):
                 if is_concurrency:
                     await pool.cleanup_chats()
                     await asyncio.sleep(1)
-                await pool.refresh_auth(current_uid)
+
                 current_uid = None
                 continue
             return JSONResponse(
@@ -1240,6 +2108,8 @@ async def chat_completions(request: Request):
                 },
             )
         except Exception as e:
+            if current_uid:
+                await pool.mark_failure(current_uid, str(e))
             logger.exception("[sync][%s] exception: %s", completion_id, e)
             if client is not None:
                 if chat_id:
@@ -1249,7 +2119,6 @@ async def chat_completions(request: Request):
                 chat_id = None
 
             if attempt == 0:
-                await pool.refresh_auth(current_uid)
                 current_uid = None
                 continue
             return JSONResponse(
@@ -1282,6 +2151,19 @@ async def chat_completions(request: Request):
 @app.post("/v1/messages")
 async def claude_messages(request: Request):
     """Anthropic Claude Messages API compatible endpoint for new-api."""
+    if await key_store.has_keys():
+        allowed_key = await _ensure_request_allowed(request)
+        if not allowed_key:
+            return JSONResponse(
+                status_code=401,
+                content={
+                    "type": "error",
+                    "error": {
+                        "type": "authentication_error",
+                        "message": "Invalid or missing API key",
+                    },
+                },
+            )
     body = await request.json()
     requested_model: str = body.get("model", "glm-5")
     claude_msgs: list[dict] = body.get("messages", [])
@@ -1456,6 +2338,8 @@ async def _claude_stream(msg_id, model, run_once, has_fc, usage_prompt):
                     bidx += 1
                 out_tk = _estimate_tokens("".join(r_parts) + "".join(a_parts))
                 yield sse_message_delta("tool_use", out_tk)
+                if current_uid:
+                    pool.mark_success(current_uid)
                 yield sse_message_stop()
                 return
 
@@ -1467,10 +2351,14 @@ async def _claude_stream(msg_id, model, run_once, has_fc, usage_prompt):
             yield sse_content_block_stop(bidx)
             out_tk = _estimate_tokens("".join(r_parts) + answer)
             yield sse_message_delta("end_turn", out_tk)
+            if current_uid:
+                pool.mark_success(current_uid)
             yield sse_message_stop()
             return
 
         except (httpcore.ReadTimeout, httpx.ReadTimeout) as e:
+            if current_uid:
+                await pool.mark_failure(current_uid, str(e))
             logger.error("[claude-stream][%s] timeout: %s", msg_id, e)
             if client:
                 if chat_id:
@@ -1481,10 +2369,12 @@ async def _claude_stream(msg_id, model, run_once, has_fc, usage_prompt):
                 yield sse_error("overloaded_error", "Upstream timeout")
                 return
             retried = True
-            await pool.refresh_auth(current_uid)
+
             current_uid = None
             continue
         except (httpcore.RemoteProtocolError, httpx.RemoteProtocolError) as e:
+            if current_uid:
+                await pool.mark_failure(current_uid, str(e))
             logger.error("[claude-stream][%s] server disconnected: %s", msg_id, e)
             if client:
                 if chat_id:
@@ -1495,10 +2385,12 @@ async def _claude_stream(msg_id, model, run_once, has_fc, usage_prompt):
                 yield sse_error("api_error", "Server disconnected, please retry")
                 return
             retried = True
-            await pool.refresh_auth(current_uid)
+
             current_uid = None
             continue
         except httpx.HTTPStatusError as e:
+            if current_uid:
+                await pool.mark_failure(current_uid, str(e))
             is_concurrency = False
             try:
                 err_body = e.response.json() if e.response else {}
@@ -1533,10 +2425,12 @@ async def _claude_stream(msg_id, model, run_once, has_fc, usage_prompt):
                 )
                 await pool.cleanup_chats()
                 await asyncio.sleep(1)
-            await pool.refresh_auth(current_uid)
+
             current_uid = None
             continue
         except Exception as e:
+            if current_uid:
+                await pool.mark_failure(current_uid, str(e))
             logger.exception("[claude-stream][%s] error: %s", msg_id, e)
             if client:
                 if chat_id:
@@ -1547,7 +2441,7 @@ async def _claude_stream(msg_id, model, run_once, has_fc, usage_prompt):
                 yield sse_error("api_error", "Upstream error after retry")
                 return
             retried = True
-            await pool.refresh_auth(current_uid)
+
             current_uid = None
             continue
         finally:
@@ -1596,11 +2490,15 @@ async def _claude_sync(msg_id, model, run_once, has_fc, usage_prompt):
 
             in_tk = _estimate_tokens(usage_prompt)
             out_tk = _estimate_tokens("".join(r_parts) + "".join(a_parts))
+            if current_uid:
+                pool.mark_success(current_uid)
             return build_non_stream_response(
                 msg_id, model, r_parts, answer, all_tcs or None, in_tk, out_tk
             )
 
         except httpx.HTTPStatusError as e:
+            if current_uid:
+                await pool.mark_failure(current_uid, str(e))
             is_concurrency = False
             try:
                 err_body = e.response.json() if e.response else {}
@@ -1624,7 +2522,7 @@ async def _claude_sync(msg_id, model, run_once, has_fc, usage_prompt):
                 if is_concurrency:
                     await pool.cleanup_chats()
                     await asyncio.sleep(1)
-                await pool.refresh_auth(current_uid)
+
                 current_uid = None
                 continue
             return JSONResponse(
@@ -1640,6 +2538,8 @@ async def _claude_sync(msg_id, model, run_once, has_fc, usage_prompt):
                 },
             )
         except Exception as e:
+            if current_uid:
+                await pool.mark_failure(current_uid, str(e))
             logger.exception("[claude-sync][%s] error: %s", msg_id, e)
             if client:
                 if chat_id:
@@ -1648,7 +2548,6 @@ async def _claude_sync(msg_id, model, run_once, has_fc, usage_prompt):
                 client = None
                 chat_id = None
             if attempt == 0:
-                await pool.refresh_auth(current_uid)
                 current_uid = None
                 continue
             return JSONResponse(
