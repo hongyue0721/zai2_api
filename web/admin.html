@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ZAI2API Control Room</title>
+  <link rel="stylesheet" href="/admin/assets/admin.css" />
+</head>
+<body>
+  <div class="shell">
+    <section class="hero">
+      <div class="badge">Magical Ops</div>
+      <h1>Free Account Control Room</h1>
+      <div class="sub">Google AI Studio 气质 + 二次元糖霜感，实时监控账号、成功率、Key、健康度与最近趋势。</div>
+    </section>
+
+    <section class="grid stats" id="stats"></section>
+
+    <section class="grid trend-grid">
+      <div class="card">
+        <div class="section-head"><strong>实时健康度</strong><span id="health-text" class="hint">载入中...</span></div>
+        <div class="health-bar"><div id="health-fill" class="health-fill"></div></div>
+        <div id="health-meta" class="hint"></div>
+      </div>
+      <div class="card">
+        <div class="section-head"><strong>最近 20 次快照</strong><span class="hint">自动刷新</span></div>
+        <canvas id="trend-canvas" width="640" height="220"></canvas>
+      </div>
+    </section>
+
+    <section class="grid two">
+      <div class="card">
+        <div class="section-head"><strong>账号池监控</strong><button class="ghost" onclick="loadDashboard()">刷新</button></div>
+        <div class="row" style="margin-bottom:12px;"><button onclick="addAccount()">+ 增加账号</button></div>
+        <table>
+          <thead><tr><th>账号</th><th>状态</th><th>调用</th><th>成功</th><th>失败</th><th>成功率</th><th>最近状态</th><th>操作</th></tr></thead>
+          <tbody id="accounts"></tbody>
+        </table>
+      </div>
+
+      <div class="card">
+        <strong>API Key 管理</strong>
+        <div class="hint" style="margin:8px 0 14px;">支持随机生成，也支持你自己填自定义 Key。</div>
+        <form id="key-form">
+          <input name="name" placeholder="Key 名称，例如 面板A / 本地脚本" />
+          <input name="key" placeholder="留空则随机生成，自定义示例：sk-my-custom-key" />
+          <button type="submit">创建 Key</button>
+        </form>
+        <div class="msg" id="key-msg"></div>
+        <table>
+          <thead><tr><th>名称</th><th>Key</th><th>调用数</th><th>最近使用</th><th>操作</th></tr></thead>
+          <tbody id="keys"></tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+  <script src="/admin/assets/admin.js"></script>
+</body>
+</html>
