@@ -26,8 +26,8 @@
           <div class="sub">统一查看账号池、调用情况、Key 管理和失败重建策略。</div>
         </div>
         <div class="hero-actions">
-          <button class="ghost" onclick="loadDashboard()">立即刷新</button>
-          <button class="ghost" onclick="logout()">退出登录</button>
+          <button class="ghost" type="button" id="refresh-btn">立即刷新</button>
+          <button class="ghost" type="button" id="logout-btn">退出登录</button>
         </div>
       </div>
     </section>
@@ -50,7 +50,7 @@
       <div class="stack">
       <div class="card">
         <div class="section-head"><strong>账号池监控</strong><span class="hint">实时状态</span></div>
-        <div class="row" style="margin-bottom:12px;"><button onclick="addAccount()">+ 增加账号</button></div>
+        <div class="row" style="margin-bottom:12px;"><button type="button" id="add-account-btn">+ 增加账号</button></div>
         <table>
           <thead><tr><th>账号</th><th>状态</th><th>调用</th><th>成功</th><th>失败</th><th>成功率</th><th>最近状态</th><th>操作</th></tr></thead>
           <tbody id="accounts"></tbody>

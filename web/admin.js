@@ -118,7 +118,7 @@ async function loadDashboard() {
         <td>${acc.failure_count}</td>
         <td><span class="pill ${acc.success_rate >= 80 ? 'ok' : acc.success_rate >= 50 ? 'warn' : 'bad'}">${acc.success_rate}%</span></td>
         <td><div>${acc.last_success_at || '暂无'}</div><div class="hint">${acc.last_error || '无错误'}</div></td>
-        <td><button class="ghost" ${acc.active > 0 ? 'disabled' : ''} onclick="removeAccount('${acc.user_id}')">移除</button></td>
+        <td><button class="ghost remove-account-btn" data-user-id="${acc.user_id}" ${acc.active > 0 ? 'disabled' : ''}>移除</button></td>
       </tr>`).join('');
 
     const keys = await api('/admin/api/keys');
@@ -128,12 +128,12 @@ async function loadDashboard() {
         <td>
           <div class="key-cell">
             <span title="${item.key}">${revealKeys ? item.key : shortKey(item.key)}</span>
-            <button class="ghost icon-btn" onclick="copyKey('${item.id}')">复制</button>
+            <button class="ghost icon-btn copy-key-btn" data-key-id="${item.id}">复制</button>
           </div>
         </td>
         <td>${item.total_requests}</td>
         <td>${item.last_used_at || '暂无'}</td>
-        <td><button class="ghost" onclick="deleteKey('${item.id}')">删除</button></td>
+        <td><button class="ghost delete-key-btn" data-key-id="${item.id}">删除</button></td>
       </tr>`).join('');
 
     window.__keyMap = Object.fromEntries(keys.data.map(item => [item.id, item.key]));
@@ -164,6 +164,28 @@ async function copyKey(id) {
 }
 
 document.addEventListener('DOMContentLoaded', () => {
+  document.getElementById('refresh-btn').addEventListener('click', loadDashboard);
+  document.getElementById('logout-btn').addEventListener('click', logout);
+  document.getElementById('add-account-btn').addEventListener('click', addAccount);
+
+  document.getElementById('accounts').addEventListener('click', async (e) => {
+    const btn = e.target.closest('.remove-account-btn');
+    if (!btn || btn.disabled) return;
+    await removeAccount(btn.dataset.userId);
+  });
+
+  document.getElementById('keys').addEventListener('click', async (e) => {
+    const copyBtn = e.target.closest('.copy-key-btn');
+    if (copyBtn) {
+      await copyKey(copyBtn.dataset.keyId);
+      return;
+    }
+    const deleteBtn = e.target.closest('.delete-key-btn');
+    if (deleteBtn) {
+      await deleteKey(deleteBtn.dataset.keyId);
+    }
+  });
+
   document.getElementById('login-form').addEventListener('submit', async (e) => {
     e.preventDefault();
     const fd = new FormData(e.target);
