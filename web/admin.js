@@ -184,22 +184,6 @@ async function copyKey(id) {
 }
 
 document.addEventListener('DOMContentLoaded', () => {
-  const refreshBtn = document.getElementById('refresh-btn');
-  const logoutBtn = document.getElementById('logout-btn');
-  
-  if (refreshBtn) {
-    refreshBtn.addEventListener('click', (e) => {
-      e.preventDefault();
-      loadDashboard();
-    });
-  }
-  
-  if (logoutBtn) {
-    logoutBtn.addEventListener('click', (e) => {
-      e.preventDefault();
-      logout();
-    });
-  }
   document.getElementById('add-account-btn').addEventListener('click', addAccount);
 
   document.getElementById('accounts').addEventListener('click', async (e) => {

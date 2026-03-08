@@ -27,7 +27,6 @@ body {
 .hero { padding: 24px 28px; position: relative; overflow: hidden; }
 .hero::after { content: ""; position: absolute; inset: auto -80px -80px auto; width: 240px; height: 240px; background: radial-gradient(circle, rgba(255,122,162,.28), transparent 70%); }
 .hero-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 20px; }
-.hero-actions { display: flex; gap: 10px; flex-wrap: wrap; }
 .badge { display: inline-flex; padding: 8px 12px; border-radius: 999px; background: rgba(255,255,255,.6); color: #d75f86; font-size: 12px; letter-spacing: .12em; text-transform: uppercase; }
 h1 { margin: 12px 0 0; font-size: 34px; }
 .sub { color: var(--muted); margin-top: 10px; max-width: 640px; line-height: 1.6; }
