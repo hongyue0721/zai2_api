@@ -1,4 +1,5 @@
 const historyPoints = [];
+let revealKeys = false;
 
 async function api(url, options = {}) {
   const res = await fetch(url, { headers: { 'Content-Type': 'application/json' }, credentials: 'include', ...options });
@@ -19,6 +20,10 @@ function card(label, value, extra = '') {
 
 function shortKey(v) {
   return v.length > 20 ? `${v.slice(0, 10)}...${v.slice(-6)}` : v;
+}
+
+async function copyText(value) {
+  await navigator.clipboard.writeText(value);
 }
 
 function healthText(rate) {
@@ -103,11 +108,18 @@ async function loadDashboard() {
     document.getElementById('keys').innerHTML = keys.data.map(item => `
       <tr>
         <td>${item.name}</td>
-        <td title="${item.key}">${shortKey(item.key)}</td>
+        <td>
+          <div class="key-cell">
+            <span title="${item.key}">${revealKeys ? item.key : shortKey(item.key)}</span>
+            <button class="ghost icon-btn" onclick="copyKey('${item.id}')">复制</button>
+          </div>
+        </td>
         <td>${item.total_requests}</td>
         <td>${item.last_used_at || '暂无'}</td>
         <td><button class="ghost" onclick="deleteKey('${item.id}')">删除</button></td>
       </tr>`).join('');
+
+    window.__keyMap = Object.fromEntries(keys.data.map(item => [item.id, item.key]));
 
     pushHistory(data);
   } catch (err) {
@@ -123,6 +135,16 @@ async function addAccount() { await api('/admin/api/accounts', { method: 'POST',
 async function removeAccount(userId) { await api(`/admin/api/accounts/${userId}`, { method: 'DELETE' }); loadDashboard(); }
 async function deleteKey(id) { await api(`/admin/api/keys/${id}`, { method: 'DELETE' }); loadDashboard(); }
 async function logout() { await api('/admin/api/logout', { method: 'POST', body: '{}' }); showLoggedIn(false); }
+async function copyKey(id) {
+  const value = window.__keyMap?.[id];
+  if (!value) return;
+  try {
+    await copyText(value);
+    document.getElementById('key-msg').textContent = '已复制 Key';
+  } catch (err) {
+    document.getElementById('key-msg').textContent = '复制失败，请检查浏览器权限';
+  }
+}
 
 document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('login-form').addEventListener('submit', async (e) => {
@@ -150,6 +172,12 @@ document.addEventListener('DOMContentLoaded', () => {
     } catch (err) {
       document.getElementById('key-msg').textContent = err.message;
     }
+  });
+
+  document.getElementById('toggle-keys-btn').addEventListener('click', () => {
+    revealKeys = !revealKeys;
+    document.getElementById('toggle-keys-btn').textContent = revealKeys ? '隐藏完整 Key' : '显示完整 Key';
+    loadDashboard();
   });
 
   document.getElementById('password-form').addEventListener('submit', async (e) => {
