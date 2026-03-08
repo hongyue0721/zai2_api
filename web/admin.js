@@ -24,22 +24,42 @@ function shortKey(v) {
 
 async function copyText(value) {
   if (navigator.clipboard && window.isSecureContext) {
-    await navigator.clipboard.writeText(value);
-    return;
+    try {
+      await navigator.clipboard.writeText(value);
+      return;
+    } catch (e) {
+      console.warn('Clipboard API failed, falling back to legacy method');
+    }
   }
   const input = document.createElement('textarea');
   input.value = value;
   input.setAttribute('readonly', '');
   input.style.position = 'fixed';
   input.style.opacity = '0';
+  input.style.top = '0';
+  input.style.left = '0';
   input.style.pointerEvents = 'none';
   document.body.appendChild(input);
   input.focus();
   input.select();
-  const ok = document.execCommand('copy');
-  document.body.removeChild(input);
-  if (!ok) {
-    throw new Error('copy_failed');
+  try {
+    const ok = document.execCommand('copy');
+    document.body.removeChild(input);
+    if (!ok) {
+      throw new Error('copy_failed');
+    }
+  } catch (e) {
+    document.body.removeChild(input);
+    const range = document.createRange();
+    range.selectNode(document.body);
+    window.getSelection().removeAllRanges();
+    window.getSelection().addRange(range);
+    try {
+      document.execCommand('copy');
+      window.getSelection().removeAllRanges();
+    } catch (e2) {
+      throw new Error('copy_failed');
+    }
   }
 }
 
@@ -164,8 +184,22 @@ async function copyKey(id) {
 }
 
 document.addEventListener('DOMContentLoaded', () => {
-  document.getElementById('refresh-btn').addEventListener('click', loadDashboard);
-  document.getElementById('logout-btn').addEventListener('click', logout);
+  const refreshBtn = document.getElementById('refresh-btn');
+  const logoutBtn = document.getElementById('logout-btn');
+  
+  if (refreshBtn) {
+    refreshBtn.addEventListener('click', (e) => {
+      e.preventDefault();
+      loadDashboard();
+    });
+  }
+  
+  if (logoutBtn) {
+    logoutBtn.addEventListener('click', (e) => {
+      e.preventDefault();
+      logout();
+    });
+  }
   document.getElementById('add-account-btn').addEventListener('click', addAccount);
 
   document.getElementById('accounts').addEventListener('click', async (e) => {
