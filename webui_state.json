@@ -1,0 +1,16 @@
+{
+  "api_keys": [
+    {
+      "id": "key_6d3171928bc9",
+      "name": "未命名 Key",
+      "key": "1233434xas",
+      "created_at": 1772981721.7658455,
+      "last_used_at": 1772981765.4422085,
+      "total_requests": 2
+    }
+  ],
+  "target_pool_size": 3,
+  "admin_password_hash": "e69ff3ad8f4c63de72d918505220a42aa45183e1333fe072a29dce8a010f9bdd",
+  "rebuild_cooldown": 30,
+  "rebuild_max_retries": 3
+}
