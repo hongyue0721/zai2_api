@@ -8,29 +8,27 @@
 </head>
 <body>
   <div class="shell">
-    <section class="card login-card" id="login-card">
+    <section class="card login-card animate-in" id="login-card">
       <div class="section-head"><strong>Admin 登录</strong><span class="hint">请输入管理密码</span></div>
       <form id="login-form">
-        <input type="password" name="password" placeholder="输入管理密码" />
+        <input type="password" name="password" placeholder="输入管理密码" autocomplete="current-password" />
         <button type="submit">登录后台</button>
       </form>
       <div class="msg" id="login-msg"></div>
     </section>
 
     <div id="admin-app" class="hidden">
-    <section class="hero">
-      <div class="hero-top">
-        <div>
-          <div class="badge">zai2api</div>
-          <h1>zai2api</h1>
-          <div class="sub">统一查看账号池、调用情况、Key 管理和失败重建策略。</div>
-        </div>
+    <section class="hero card animate-in">
+      <div class="hero-content">
+        <div class="badge">zai2api</div>
+        <h1>zai2api</h1>
+        <div class="sub">统一查看账号池、调用情况、Key 管理和失败重建策略。</div>
       </div>
     </section>
 
-    <section class="grid stats" id="stats"></section>
+    <section class="grid stats animate-in" id="stats"></section>
 
-    <section class="grid trend-grid">
+    <section class="grid trend-grid animate-in">
       <div class="card">
         <div class="section-head"><strong>实时健康度</strong><span id="health-text" class="hint">载入中...</span></div>
         <div class="health-bar"><div id="health-fill" class="health-fill"></div></div>
@@ -42,20 +40,21 @@
       </div>
     </section>
 
-    <section class="grid content-grid">
+    <section class="grid content-grid animate-in">
       <div class="stack">
       <div class="card">
         <div class="section-head"><strong>总统计</strong><span class="hint">按账号汇总</span></div>
-        <div class="row" style="margin-bottom:12px;"><button type="button" id="add-account-btn">+ 增加账号</button></div>
-        <table>
-          <thead><tr><th>账号</th><th>状态</th><th>调用</th><th>成功</th><th>失败</th><th>成功率</th><th>最近状态</th><th>操作</th></tr></thead>
-          <tbody id="accounts"></tbody>
-        </table>
+        <div class="row" style="margin-bottom:16px;"><button type="button" id="add-account-btn">+ 增加账号</button></div>
+        <div class="table-wrapper">
+          <table>
+            <thead><tr><th>Token</th><th>状态</th><th>调用</th><th>成功</th><th>失败</th><th>成功率</th><th>最近状态</th><th>操作</th></tr></thead>
+            <tbody id="accounts"></tbody>
+          </table>
+        </div>
       </div>
 
       <div class="card">
-        <strong>API Key 管理</strong>
-        <div class="hint" style="margin:8px 0 14px;">支持随机生成，也支持你自己填自定义 Key。</div>
+        <div class="section-head"><strong>API Key 管理</strong><span class="hint">支持随机生成，也支持自定义</span></div>
         <div class="key-toolbar">
           <button type="button" class="ghost" id="toggle-keys-btn">显示完整 Key</button>
         </div>
@@ -65,23 +64,25 @@
           <button type="submit">创建 Key</button>
         </form>
         <div class="msg" id="key-msg"></div>
-        <table>
-          <thead><tr><th>名称</th><th>Key</th><th>调用数</th><th>最近使用</th><th>操作</th></tr></thead>
-          <tbody id="keys"></tbody>
-        </table>
+        <div class="table-wrapper">
+          <table>
+            <thead><tr><th>名称</th><th>Key</th><th>调用数</th><th>最近使用</th><th>操作</th></tr></thead>
+            <tbody id="keys"></tbody>
+          </table>
+        </div>
       </div>
       </div>
 
-      <div class="card settings-card">
-        <strong>设置</strong>
-        <div class="hint" style="margin:8px 0 14px;">你可以在这里修改 admin 密码，以及失败重建的冷却与重试上限。</div>
+      <div class="card settings-card animate-in">
+        <div class="section-head"><strong>设置</strong><span class="hint">修改密码与重建策略</span></div>
         <form id="password-form">
-          <input type="password" name="current_password" placeholder="当前密码" />
-          <input type="password" name="new_password" placeholder="新密码，至少 6 位" />
+          <div class="field-note">修改管理密码</div>
+          <input type="password" name="current_password" placeholder="当前密码" autocomplete="current-password" />
+          <input type="password" name="new_password" placeholder="新密码，至少 6 位" autocomplete="new-password" />
           <button type="submit">修改密码</button>
         </form>
         <div class="msg" id="password-msg"></div>
-        <form id="rebuild-form" style="margin-top:14px;">
+        <form id="rebuild-form" style="margin-top:24px;">
           <div class="field-note">失败重建冷却时间（秒）<span>账号失败后，至少等待多久才允许继续自动补新号</span></div>
           <input type="number" name="rebuild_cooldown" min="0" placeholder="失败重建冷却时间（秒）" />
           <div class="field-note">5 分钟内重试上限<span>同一轮异常窗口内，最多自动重建多少次</span></div>

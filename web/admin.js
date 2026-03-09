@@ -15,11 +15,25 @@ function showLoggedIn(loggedIn) {
 }
 
 function card(label, value, extra = '') {
-  return `<div class="card"><div class="label">${label}</div><div class="stat-num">${value}</div><div class="hint">${extra}</div></div>`;
+  return `<div class="card stat-card"><div class="label">${label}</div><div class="stat-num">${value}</div><div class="stat-extra">${extra}</div></div>`;
 }
 
 function shortKey(v) {
   return v.length > 20 ? `${v.slice(0, 10)}...${v.slice(-6)}` : v;
+}
+
+function shortToken(v) {
+  if (!v) return '暂无 token';
+  return v.length > 24 ? `${v.slice(0, 8)}...${v.slice(-8)}` : v;
+}
+
+function escapeHtml(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
 async function copyText(value) {
@@ -131,13 +145,21 @@ async function loadDashboard() {
 
     document.getElementById('accounts').innerHTML = data.accounts.map(acc => `
       <tr>
-        <td><div><strong>${acc.username || 'Guest'}</strong></div><div class="hint">${acc.user_id}</div></td>
+        <td>
+          <div class="token-cell">
+            <div class="token-row">
+              <span class="token-main" title="${escapeHtml(acc.token || '')}">${escapeHtml(shortToken(acc.token || ''))}</span>
+              <button class="ghost icon-btn copy-token-btn" data-token="${escapeHtml(acc.token || '')}" ${acc.token ? '' : 'disabled'}>复制</button>
+            </div>
+            <span class="hint token-meta">${acc.user_id}</span>
+          </div>
+        </td>
         <td><span class="pill ${acc.valid ? 'ok' : 'bad'}">${acc.valid ? '正常' : '失效'}</span></td>
         <td>${acc.request_count}</td>
         <td>${acc.success_count}</td>
         <td>${acc.failure_count}</td>
         <td><span class="pill ${acc.success_rate >= 80 ? 'ok' : acc.success_rate >= 50 ? 'warn' : 'bad'}">${acc.success_rate}%</span></td>
-        <td><div>${acc.last_success_at || '暂无'}</div><div class="hint">${acc.last_error || '无错误'}</div></td>
+        <td><div class="status-line">成功：${acc.last_success_at || '暂无'}</div><div class="hint">错误：${acc.last_error || '无错误'}</div></td>
         <td><button class="ghost remove-account-btn" data-user-id="${acc.user_id}" ${acc.active > 0 ? 'disabled' : ''}>移除</button></td>
       </tr>`).join('');
 
@@ -172,6 +194,15 @@ async function addAccount() { await api('/admin/api/accounts', { method: 'POST',
 async function removeAccount(userId) { await api(`/admin/api/accounts/${userId}`, { method: 'DELETE' }); loadDashboard(); }
 async function deleteKey(id) { await api(`/admin/api/keys/${id}`, { method: 'DELETE' }); loadDashboard(); }
 async function logout() { await api('/admin/api/logout', { method: 'POST', body: '{}' }); showLoggedIn(false); }
+async function copyAccountToken(token) {
+  if (!token) return;
+  try {
+    await copyText(token);
+    document.getElementById('key-msg').textContent = '已复制账号 Token';
+  } catch (err) {
+    document.getElementById('key-msg').textContent = '复制 Token 失败，请尝试使用 HTTPS、localhost，或手动长按复制';
+  }
+}
 async function copyKey(id) {
   const value = window.__keyMap?.[id];
   if (!value) return;
@@ -187,6 +218,11 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('add-account-btn').addEventListener('click', addAccount);
 
   document.getElementById('accounts').addEventListener('click', async (e) => {
+    const copyBtn = e.target.closest('.copy-token-btn');
+    if (copyBtn) {
+      await copyAccountToken(copyBtn.dataset.token || '');
+      return;
+    }
     const btn = e.target.closest('.remove-account-btn');
     if (!btn || btn.disabled) return;
     await removeAccount(btn.dataset.userId);

@@ -312,6 +312,7 @@ class AccountInfo:
         return {
             "user_id": self.user_id,
             "username": self.username,
+            "token": self.token,
             "created_at": _iso_ts(self.created_at),
             "age_seconds": round(self.age, 1),
             "active": self.active,
@@ -1170,141 +1171,581 @@ def _read_admin_asset(path: Path, fallback: str) -> str:
 
 
 ADMIN_HTML_FALLBACK = """<!DOCTYPE html>
-<html lang=\"zh-CN\">
+<html lang="zh-CN">
 <head>
-  <meta charset=\"UTF-8\" />
-  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>zai2api</title>
-  <link rel=\"stylesheet\" href=\"/admin/assets/admin.css\" />
+  <link rel="stylesheet" href="/admin/assets/admin.css" />
 </head>
 <body>
-  <div class=\"shell\">
-    <section class=\"hero\">
-      <div class=\"badge\">zai2api</div>
-      <h1>zai2api</h1>
-      <div class=\"sub\">Google AI Studio 气质 + 二次元糖霜感，实时监控账号、成功率、Key、健康度与最近趋势。</div>
+  <div class="shell">
+    <section class="card login-card animate-in" id="login-card">
+      <div class="section-head"><strong>Admin 登录</strong><span class="hint">请输入管理密码</span></div>
+      <form id="login-form">
+        <input type="password" name="password" placeholder="输入管理密码" autocomplete="current-password" />
+        <button type="submit">登录后台</button>
+      </form>
+      <div class="msg" id="login-msg"></div>
     </section>
 
-    <section class=\"grid stats\" id=\"stats\"></section>
-
-    <section class=\"grid trend-grid\">
-      <div class=\"card\">
-        <div class=\"section-head\"><strong>实时健康度</strong><span id=\"health-text\" class=\"hint\">载入中...</span></div>
-        <div class=\"health-bar\"><div id=\"health-fill\" class=\"health-fill\"></div></div>
-        <div id=\"health-meta\" class=\"hint\"></div>
-      </div>
-      <div class=\"card\">
-        <div class=\"section-head\"><strong>最近 20 次快照</strong><span class=\"hint\">自动刷新</span></div>
-        <canvas id=\"trend-canvas\" width=\"640\" height=\"220\"></canvas>
+    <div id="admin-app" class="hidden">
+    <section class="hero card animate-in">
+      <div class="hero-content">
+        <div class="badge">zai2api</div>
+        <h1>zai2api</h1>
+        <div class="sub">统一查看账号池、调用情况、Key 管理和失败重建策略。</div>
       </div>
     </section>
 
-    <section class=\"grid two\">
-      <div class=\"card\">
-        <div class=\"section-head\"><strong>账号池监控</strong><button class=\"ghost\" onclick=\"loadDashboard()\">刷新</button></div>
-        <div class=\"row\" style=\"margin-bottom:12px;\"><button onclick=\"addAccount()\">+ 增加账号</button></div>
-        <table>
-          <thead><tr><th>账号</th><th>状态</th><th>调用</th><th>成功</th><th>失败</th><th>成功率</th><th>最近状态</th><th>操作</th></tr></thead>
-          <tbody id=\"accounts\"></tbody>
-        </table>
+    <section class="grid stats animate-in" id="stats"></section>
+
+    <section class="grid trend-grid animate-in">
+      <div class="card">
+        <div class="section-head"><strong>实时健康度</strong><span id="health-text" class="hint">载入中...</span></div>
+        <div class="health-bar"><div id="health-fill" class="health-fill"></div></div>
+        <div id="health-meta" class="hint"></div>
+      </div>
+      <div class="card">
+        <div class="section-head"><strong>最近 20 次快照</strong><span class="hint">自动刷新</span></div>
+        <canvas id="trend-canvas" width="640" height="220"></canvas>
+      </div>
+    </section>
+
+    <section class="grid content-grid animate-in">
+      <div class="stack">
+      <div class="card">
+        <div class="section-head"><strong>总统计</strong><span class="hint">按账号汇总</span></div>
+        <div class="row" style="margin-bottom:16px;"><button type="button" id="add-account-btn">+ 增加账号</button></div>
+        <div class="table-wrapper">
+          <table>
+            <thead><tr><th>Token</th><th>状态</th><th>调用</th><th>成功</th><th>失败</th><th>成功率</th><th>最近状态</th><th>操作</th></tr></thead>
+            <tbody id="accounts"></tbody>
+          </table>
+        </div>
       </div>
 
-      <div class=\"card\">
-        <strong>API Key 管理</strong>
-        <div class=\"hint\" style=\"margin:8px 0 14px;\">支持随机生成，也支持你自己填自定义 Key。</div>
-        <form id=\"key-form\">
-          <input name=\"name\" placeholder=\"Key 名称，例如 面板A / 本地脚本\" />
-          <input name=\"key\" placeholder=\"留空则随机生成，自定义示例：sk-my-custom-key\" />
-          <button type=\"submit\">创建 Key</button>
+      <div class="card">
+        <div class="section-head"><strong>API Key 管理</strong><span class="hint">支持随机生成，也支持自定义</span></div>
+        <div class="key-toolbar">
+          <button type="button" class="ghost" id="toggle-keys-btn">显示完整 Key</button>
+        </div>
+        <form id="key-form">
+          <input name="name" placeholder="Key 名称，例如 面板A / 本地脚本" />
+          <input name="key" placeholder="留空则随机生成，自定义示例：sk-my-custom-key" />
+          <button type="submit">创建 Key</button>
         </form>
-        <div class=\"msg\" id=\"key-msg\"></div>
-        <table>
-          <thead><tr><th>名称</th><th>Key</th><th>调用数</th><th>最近使用</th><th>操作</th></tr></thead>
-          <tbody id=\"keys\"></tbody>
-        </table>
+        <div class="msg" id="key-msg"></div>
+        <div class="table-wrapper">
+          <table>
+            <thead><tr><th>名称</th><th>Key</th><th>调用数</th><th>最近使用</th><th>操作</th></tr></thead>
+            <tbody id="keys"></tbody>
+          </table>
+        </div>
+      </div>
+      </div>
+
+      <div class="card settings-card animate-in">
+        <div class="section-head"><strong>设置</strong><span class="hint">修改密码与重建策略</span></div>
+        <form id="password-form">
+          <div class="field-note">修改管理密码</div>
+          <input type="password" name="current_password" placeholder="当前密码" autocomplete="current-password" />
+          <input type="password" name="new_password" placeholder="新密码，至少 6 位" autocomplete="new-password" />
+          <button type="submit">修改密码</button>
+        </form>
+        <div class="msg" id="password-msg"></div>
+        <form id="rebuild-form" style="margin-top:24px;">
+          <div class="field-note">失败重建冷却时间（秒）<span>账号失败后，至少等待多久才允许继续自动补新号</span></div>
+          <input type="number" name="rebuild_cooldown" min="0" placeholder="失败重建冷却时间（秒）" />
+          <div class="field-note">5 分钟内重试上限<span>同一轮异常窗口内，最多自动重建多少次</span></div>
+          <input type="number" name="rebuild_max_retries" min="1" placeholder="5 分钟内重试上限" />
+          <button type="submit">保存重建策略</button>
+        </form>
+        <div class="msg" id="rebuild-msg"></div>
       </div>
     </section>
+    </div>
   </div>
-  <script src=\"/admin/assets/admin.js\"></script>
+  <script src="/admin/assets/admin.js"></script>
 </body>
-</html>"""
+</html>
+"""
 
 
 ADMIN_CSS_FALLBACK = """:root {
-  --bg: #fff7fb;
-  --bg2: #eef6ff;
-  --panel: rgba(255,255,255,.82);
-  --line: rgba(80, 100, 140, .16);
-  --text: #25324a;
-  --muted: #6f7c97;
-  --accent: #ff7aa2;
-  --accent2: #73b7ff;
-  --good: #1fa971;
-  --bad: #e05b75;
-  --warn: #f4a340;
-  --shadow: 0 20px 60px rgba(101, 119, 164, .18);
+  --google-blue: #1a73e8;
+  --google-blue-light: #e8f0fe;
+  --google-green: #34a853;
+  --google-red: #ea4335;
+  --google-yellow: #fbbc04;
+  --text-primary: #202124;
+  --text-secondary: #5f6368;
+  --border-color: #dadce0;
+  --bg-color: #f8f9fa;
+  --card-bg: #ffffff;
+  --hover-bg: #f1f3f4;
+  --shadow-sm: 0 1px 2px 0 rgba(60,64,67,.3), 0 1px 3px 1px rgba(60,64,67,.15);
+  --shadow-md: 0 1px 3px 0 rgba(60,64,67,.3), 0 4px 8px 3px rgba(60,64,67,.15);
+  --shadow-lg: 0 1px 3px 0 rgba(60,64,67,.3), 0 8px 16px 4px rgba(60,64,67,.15);
+  --radius: 8px;
+  --radius-lg: 16px;
 }
-* { box-sizing: border-box; }
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
 body {
-  margin: 0;
-  font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
-  color: var(--text);
-  background: radial-gradient(circle at top left, rgba(255,122,162,.22), transparent 30%), radial-gradient(circle at top right, rgba(115,183,255,.20), transparent 28%), linear-gradient(135deg, var(--bg), var(--bg2));
+  font-family: 'Google Sans', 'Segoe UI', 'Microsoft YaHei', system-ui, sans-serif;
+  background: var(--bg-color);
+  color: var(--text-primary);
   min-height: 100vh;
+  line-height: 1.5;
 }
-.shell { max-width: 1320px; margin: 0 auto; padding: 28px; }
-.hero, .card { background: var(--panel); border: 1px solid var(--line); backdrop-filter: blur(20px); border-radius: 28px; box-shadow: var(--shadow); }
-.hero { padding: 28px; position: relative; overflow: hidden; }
-.hero::after { content: ""; position: absolute; inset: auto -80px -80px auto; width: 240px; height: 240px; background: radial-gradient(circle, rgba(255,122,162,.28), transparent 70%); }
-.badge { display: inline-flex; padding: 8px 12px; border-radius: 999px; background: rgba(255,255,255,.6); color: #d75f86; font-size: 12px; letter-spacing: .12em; text-transform: uppercase; }
-h1 { margin: 12px 0 0; font-size: 34px; }
-.sub { color: var(--muted); margin-top: 10px; }
-.grid { display: grid; gap: 18px; margin-top: 20px; }
-.stats { grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
-.trend-grid { grid-template-columns: .8fr 1.2fr; }
-.two { grid-template-columns: 1.2fr .8fr; }
-.card { padding: 20px; }
-.stat-num { font-size: 30px; font-weight: 800; margin-top: 8px; }
-.label { color: var(--muted); font-size: 13px; letter-spacing: .08em; text-transform: uppercase; }
-.section-head { display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom: 12px; }
-table { width: 100%; border-collapse: collapse; }
-th, td { text-align: left; padding: 12px 10px; border-bottom: 1px solid var(--line); font-size: 14px; vertical-align: top; }
-th { color: var(--muted); font-weight: 600; }
-.pill { display: inline-block; padding: 6px 10px; border-radius: 999px; font-size: 12px; font-weight: 700; }
-.ok { background: rgba(31,169,113,.12); color: var(--good); }
-.bad { background: rgba(224,91,117,.12); color: var(--bad); }
-.busy { background: rgba(115,183,255,.15); color: #3375bf; }
-.warn { background: rgba(244,163,64,.15); color: #b87317; }
-form { display: grid; gap: 12px; }
-input { width: 100%; padding: 14px 16px; border-radius: 16px; border: 1px solid var(--line); background: rgba(255,255,255,.86); color: var(--text); outline: none; }
-button { border: 0; border-radius: 16px; padding: 12px 16px; cursor: pointer; font-weight: 700; background: linear-gradient(135deg, var(--accent), var(--accent2)); color: white; }
-button.ghost { background: rgba(37,50,74,.08); color: var(--text); }
-button:disabled { opacity: .5; cursor: not-allowed; }
-.row { display: flex; gap: 10px; flex-wrap: wrap; }
-.hint, .msg { color: var(--muted); font-size: 13px; }
-.msg { min-height: 20px; margin-top: 8px; }
-.health-bar { width: 100%; height: 16px; background: rgba(37,50,74,.08); border-radius: 999px; overflow: hidden; margin: 14px 0 10px; }
-.health-fill { height: 100%; border-radius: 999px; background: linear-gradient(90deg, var(--bad), var(--warn), var(--good)); width: 0%; transition: width .35s ease; }
-canvas { width: 100%; height: 220px; display: block; background: linear-gradient(180deg, rgba(255,255,255,.7), rgba(255,255,255,.38)); border-radius: 18px; }
-@media (max-width: 960px) { .two, .trend-grid { grid-template-columns: 1fr; } .shell { padding: 16px; } }
+
+.shell { max-width: 1400px; margin: 0 auto; padding: 24px; }
+.hidden { display: none !important; }
+
+/* 卡片 */
+.card {
+  background: var(--card-bg);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-sm);
+  padding: 24px;
+  transition: box-shadow 0.2s ease, transform 0.2s ease;
+}
+.card:hover {
+  box-shadow: var(--shadow-md);
+}
+
+.login-card {
+  max-width: 400px;
+  margin: 80px auto 0;
+}
+
+/* Hero */
+.hero {
+  background: linear-gradient(135deg, var(--google-blue) 0%, #4285f4 100%);
+  color: white;
+  padding: 32px 40px;
+  position: relative;
+  overflow: hidden;
+}
+.hero::before {
+  content: '';
+  position: absolute;
+  top: -50%;
+  right: -20%;
+  width: 400px;
+  height: 400px;
+  background: rgba(255,255,255,0.1);
+  border-radius: 50%;
+}
+.hero::after {
+  content: '';
+  position: absolute;
+  bottom: -30%;
+  left: -10%;
+  width: 300px;
+  height: 300px;
+  background: rgba(255,255,255,0.05);
+  border-radius: 50%;
+}
+.hero-content { position: relative; z-index: 1; }
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  background: rgba(255,255,255,0.2);
+  border-radius: 100px;
+  font-size: 12px;
+  font-weight: 500;
+  letter-spacing: 0.5px;
+  margin-bottom: 12px;
+}
+h1 {
+  font-size: 32px;
+  font-weight: 400;
+  margin-bottom: 8px;
+}
+.sub {
+  font-size: 15px;
+  opacity: 0.9;
+  max-width: 500px;
+}
+
+/* Grid 布局 */
+.grid {
+  display: grid;
+  gap: 20px;
+  margin-top: 20px;
+}
+.stats {
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+}
+.trend-grid {
+  grid-template-columns: 1fr 1.5fr;
+}
+.content-grid {
+  grid-template-columns: 1.4fr 1fr;
+  align-items: start;
+}
+.stack { display: grid; gap: 20px; }
+
+/* 统计卡片 */
+.stat-card {
+  display: flex;
+  flex-direction: column;
+  padding: 20px;
+}
+.stat-num {
+  font-size: 36px;
+  font-weight: 400;
+  color: var(--google-blue);
+  margin: 8px 0;
+}
+.label {
+  font-size: 14px;
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+.stat-extra {
+  font-size: 13px;
+  color: var(--text-secondary);
+  margin-top: 4px;
+}
+
+/* 表格 */
+.table-wrapper {
+  overflow-x: auto;
+  margin: 0 -24px;
+  padding: 0 24px;
+}
+table {
+  width: 100%;
+  border-collapse: collapse;
+}
+th, td {
+  text-align: left;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border-color);
+  font-size: 14px;
+}
+th {
+  color: var(--text-secondary);
+  font-weight: 500;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  background: var(--bg-color);
+  position: sticky;
+  top: 0;
+}
+tr {
+  transition: background 0.15s ease;
+}
+tbody tr:hover {
+  background: var(--hover-bg);
+}
+
+/* 标签 */
+.pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 12px;
+  border-radius: 100px;
+  font-size: 12px;
+  font-weight: 500;
+}
+.ok { background: #e6f4ea; color: var(--google-green); }
+.bad { background: #fce8e6; color: var(--google-red); }
+.warn { background: #fef7e0; color: #b06000; }
+.busy { background: var(--google-blue-light); color: var(--google-blue); }
+
+/* 表单 */
+form {
+  display: grid;
+  gap: 16px;
+}
+input {
+  width: 100%;
+  padding: 12px 16px;
+  border: 2px solid var(--border-color);
+  border-radius: var(--radius);
+  font-size: 14px;
+  color: var(--text-primary);
+  background: white;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+input:focus {
+  outline: none;
+  border-color: var(--google-blue);
+  box-shadow: 0 0 0 3px rgba(26,115,232,0.2);
+}
+input::placeholder { color: var(--text-secondary); }
+
+/* 按钮 */
+button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 10px 24px;
+  border: none;
+  border-radius: var(--radius);
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  background: var(--google-blue);
+  color: white;
+}
+button:hover:not(:disabled) {
+  background: #1557b0;
+  box-shadow: var(--shadow-sm);
+}
+button:active:not(:disabled) {
+  transform: scale(0.98);
+}
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+button.ghost {
+  background: transparent;
+  color: var(--google-blue);
+}
+button.ghost:hover:not(:disabled) {
+  background: var(--google-blue-light);
+}
+button.danger {
+  background: var(--google-red);
+}
+button.danger:hover:not(:disabled) {
+  background: #d33426;
+}
+
+.icon-btn {
+  padding: 8px;
+  min-width: 36px;
+  height: 36px;
+}
+
+/* Token 单元格 */
+.token-cell {
+  display: grid;
+  gap: 4px;
+  min-width: 120px;
+}
+.token-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.token-main {
+  font-family: 'Google Sans Mono', 'Consolas', monospace;
+  font-size: 13px;
+  color: var(--text-primary);
+  word-break: break-all;
+}
+.token-meta {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+.key-cell {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.status-line {
+  font-weight: 500;
+  color: var(--text-primary);
+}
+
+/* 健康度条 */
+.health-bar {
+  height: 8px;
+  background: var(--border-color);
+  border-radius: 100px;
+  overflow: hidden;
+  margin: 16px 0;
+}
+.health-fill {
+  height: 100%;
+  border-radius: 100px;
+  background: linear-gradient(90deg, var(--google-red), var(--google-yellow), var(--google-green));
+  transition: width 0.5s ease;
+}
+
+/* Canvas */
+canvas {
+  width: 100%;
+  height: 200px;
+  border-radius: var(--radius);
+}
+
+/* 消息 */
+.msg {
+  min-height: 20px;
+  font-size: 13px;
+  color: var(--text-secondary);
+  margin-top: 8px;
+}
+.msg.success { color: var(--google-green); }
+.msg.error { color: var(--google-red); }
+
+/* 区块标题 */
+.section-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+.section-head strong {
+  font-size: 16px;
+  font-weight: 500;
+}
+.hint {
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+/* 设置卡片 */
+.settings-card {
+  position: sticky;
+  top: 24px;
+}
+.field-note {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--text-primary);
+  margin-bottom: 4px;
+}
+.field-note span {
+  display: block;
+  font-size: 13px;
+  font-weight: 400;
+  color: var(--text-secondary);
+  margin-top: 2px;
+}
+
+/* 工具栏 */
+.row {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.key-toolbar {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 16px;
+}
+
+/* 动画 */
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.animate-in {
+  animation: fadeIn 0.3s ease forwards;
+}
+
+/* 响应式 */
+@media (max-width: 1200px) {
+  .content-grid { grid-template-columns: 1fr; }
+  .settings-card { position: static; }
+}
+@media (max-width: 900px) {
+  .trend-grid { grid-template-columns: 1fr; }
+  .shell { padding: 16px; }
+  th, td { padding: 12px; font-size: 13px; }
+}
+@media (max-width: 600px) {
+  h1 { font-size: 24px; }
+  .hero { padding: 24px; }
+  .stat-num { font-size: 28px; }
+}
 """
 
 
 ADMIN_JS_FALLBACK = """const historyPoints = [];
+let revealKeys = false;
 
 async function api(url, options = {}) {
-  const res = await fetch(url, { headers: { 'Content-Type': 'application/json' }, ...options });
-  const data = await res.json();
+  const res = await fetch(url, { headers: { 'Content-Type': 'application/json' }, credentials: 'include', ...options });
+  const text = await res.text();
+  const data = text ? JSON.parse(text) : {};
   if (!res.ok) throw new Error(data.detail || data.error?.message || data.message || '请求失败');
   return data;
 }
 
+function showLoggedIn(loggedIn) {
+  document.getElementById('login-card').classList.toggle('hidden', loggedIn);
+  document.getElementById('admin-app').classList.toggle('hidden', !loggedIn);
+}
+
 function card(label, value, extra = '') {
-  return `<div class=\"card\"><div class=\"label\">${label}</div><div class=\"stat-num\">${value}</div><div class=\"hint\">${extra}</div></div>`;
+  return `<div class="card stat-card"><div class="label">${label}</div><div class="stat-num">${value}</div><div class="stat-extra">${extra}</div></div>`;
 }
 
 function shortKey(v) {
   return v.length > 20 ? `${v.slice(0, 10)}...${v.slice(-6)}` : v;
+}
+
+function shortToken(v) {
+  if (!v) return '暂无 token';
+  return v.length > 24 ? `${v.slice(0, 8)}...${v.slice(-8)}` : v;
+}
+
+function escapeHtml(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+async function copyText(value) {
+  if (navigator.clipboard && window.isSecureContext) {
+    try {
+      await navigator.clipboard.writeText(value);
+      return;
+    } catch (e) {
+      console.warn('Clipboard API failed, falling back to legacy method');
+    }
+  }
+  const input = document.createElement('textarea');
+  input.value = value;
+  input.setAttribute('readonly', '');
+  input.style.position = 'fixed';
+  input.style.opacity = '0';
+  input.style.top = '0';
+  input.style.left = '0';
+  input.style.pointerEvents = 'none';
+  document.body.appendChild(input);
+  input.focus();
+  input.select();
+  try {
+    const ok = document.execCommand('copy');
+    document.body.removeChild(input);
+    if (!ok) {
+      throw new Error('copy_failed');
+    }
+  } catch (e) {
+    document.body.removeChild(input);
+    const range = document.createRange();
+    range.selectNode(document.body);
+    window.getSelection().removeAllRanges();
+    window.getSelection().addRange(range);
+    try {
+      document.execCommand('copy');
+      window.getSelection().removeAllRanges();
+    } catch (e2) {
+      throw new Error('copy_failed');
+    }
+  }
 }
 
 function healthText(rate) {
@@ -1316,6 +1757,7 @@ function healthText(rate) {
 
 function drawTrend() {
   const canvas = document.getElementById('trend-canvas');
+  if (!canvas) return;
   const ctx = canvas.getContext('2d');
   const width = canvas.width;
   const height = canvas.height;
@@ -1350,50 +1792,138 @@ function pushHistory(data) {
 }
 
 async function loadDashboard() {
-  const data = await api('/admin/api/dashboard');
-  document.getElementById('stats').innerHTML = [
-    card('有效账号', data.valid_accounts, `目标 ${data.target_pool_size}`),
-    card('活跃请求', data.active_requests, `当前池 ${data.current_pool_size}`),
-    card('总调用', data.total_requests, '所有 free 账号累计'),
-    card('总成功', data.total_success, `成功率 ${data.success_rate}%`),
-    card('总失败', data.total_failures, `Key ${data.api_key_count} 个`),
-  ].join('');
+  try {
+    const data = await api('/admin/api/dashboard');
+    showLoggedIn(true);
+    document.getElementById('stats').innerHTML = [
+      card('有效账号', data.valid_accounts, `目标 ${data.target_pool_size}`),
+      card('活跃请求', data.active_requests, `当前池 ${data.current_pool_size}`),
+      card('总调用', data.total_requests, '所有 free 账号累计'),
+      card('总成功', data.total_success, `成功率 ${data.success_rate}%`),
+      card('总失败', data.total_failures, `Key ${data.api_key_count} 个`),
+    ].join('');
 
-  const health = Math.max(0, Math.min(100, data.success_rate));
-  document.getElementById('health-fill').style.width = `${health}%`;
-  document.getElementById('health-text').textContent = `${healthText(health)} · ${health}%`;
-  document.getElementById('health-meta').textContent = `当前 ${data.active_requests} 个活跃请求，${data.valid_accounts}/${data.current_pool_size} 个账号可用。`;
+    const health = Math.max(0, Math.min(100, data.success_rate));
+    document.getElementById('health-fill').style.width = `${health}%`;
+    document.getElementById('health-text').textContent = `${healthText(health)} · ${health}%`;
+    document.getElementById('health-meta').textContent = `当前 ${data.active_requests} 个活跃请求，${data.valid_accounts}/${data.current_pool_size} 个账号可用。失败重建冷却 ${data.rebuild_cooldown}s，5 分钟内最多 ${data.rebuild_max_retries} 次。`;
 
-  document.getElementById('accounts').innerHTML = data.accounts.map(acc => `
-    <tr>
-      <td><div><strong>${acc.username || 'Guest'}</strong></div><div class=\"hint\">${acc.user_id}</div></td>
-      <td><span class=\"pill ${acc.valid ? 'ok' : 'bad'}\">${acc.valid ? '正常' : '失效'}</span> <span class=\"pill busy\">并发 ${acc.active}</span></td>
-      <td>${acc.request_count}</td>
-      <td>${acc.success_count}</td>
-      <td>${acc.failure_count}</td>
-      <td><span class=\"pill ${acc.success_rate >= 80 ? 'ok' : acc.success_rate >= 50 ? 'warn' : 'bad'}\">${acc.success_rate}%</span></td>
-      <td><div>${acc.last_success_at || '暂无'}</div><div class=\"hint\">${acc.last_error || '无错误'}</div></td>
-      <td><button class=\"ghost\" ${acc.active > 0 ? 'disabled' : ''} onclick=\"removeAccount('${acc.user_id}')\">移除</button></td>
-    </tr>`).join('');
+    const rebuildForm = document.getElementById('rebuild-form');
+    if (rebuildForm) {
+      rebuildForm.elements.rebuild_cooldown.value = data.rebuild_cooldown;
+      rebuildForm.elements.rebuild_max_retries.value = data.rebuild_max_retries;
+    }
 
-  const keys = await api('/admin/api/keys');
-  document.getElementById('keys').innerHTML = keys.data.map(item => `
-    <tr>
-      <td>${item.name}</td>
-      <td title=\"${item.key}\">${shortKey(item.key)}</td>
-      <td>${item.total_requests}</td>
-      <td>${item.last_used_at || '暂无'}</td>
-      <td><button class=\"ghost\" onclick=\"deleteKey('${item.id}')\">删除</button></td>
-    </tr>`).join('');
+    document.getElementById('accounts').innerHTML = data.accounts.map(acc => `
+      <tr>
+        <td>
+          <div class="token-cell">
+            <div class="token-row">
+              <span class="token-main" title="${escapeHtml(acc.token || '')}">${escapeHtml(shortToken(acc.token || ''))}</span>
+              <button class="ghost icon-btn copy-token-btn" data-token="${escapeHtml(acc.token || '')}" ${acc.token ? '' : 'disabled'}>复制</button>
+            </div>
+            <span class="hint token-meta">${acc.user_id}</span>
+          </div>
+        </td>
+        <td><span class="pill ${acc.valid ? 'ok' : 'bad'}">${acc.valid ? '正常' : '失效'}</span></td>
+        <td>${acc.request_count}</td>
+        <td>${acc.success_count}</td>
+        <td>${acc.failure_count}</td>
+        <td><span class="pill ${acc.success_rate >= 80 ? 'ok' : acc.success_rate >= 50 ? 'warn' : 'bad'}">${acc.success_rate}%</span></td>
+        <td><div class="status-line">成功：${acc.last_success_at || '暂无'}</div><div class="hint">错误：${acc.last_error || '无错误'}</div></td>
+        <td><button class="ghost remove-account-btn" data-user-id="${acc.user_id}" ${acc.active > 0 ? 'disabled' : ''}>移除</button></td>
+      </tr>`).join('');
 
-  pushHistory(data);
+    const keys = await api('/admin/api/keys');
+    document.getElementById('keys').innerHTML = keys.data.map(item => `
+      <tr>
+        <td>${item.name}</td>
+        <td>
+          <div class="key-cell">
+            <span title="${item.key}">${revealKeys ? item.key : shortKey(item.key)}</span>
+            <button class="ghost icon-btn copy-key-btn" data-key-id="${item.id}">复制</button>
+          </div>
+        </td>
+        <td>${item.total_requests}</td>
+        <td>${item.last_used_at || '暂无'}</td>
+        <td><button class="ghost delete-key-btn" data-key-id="${item.id}">删除</button></td>
+      </tr>`).join('');
+
+    window.__keyMap = Object.fromEntries(keys.data.map(item => [item.id, item.key]));
+
+    pushHistory(data);
+  } catch (err) {
+    if (String(err.message).includes('Admin auth required')) {
+      showLoggedIn(false);
+      return;
+    }
+    throw err;
+  }
 }
 
 async function addAccount() { await api('/admin/api/accounts', { method: 'POST', body: '{}' }); loadDashboard(); }
 async function removeAccount(userId) { await api(`/admin/api/accounts/${userId}`, { method: 'DELETE' }); loadDashboard(); }
 async function deleteKey(id) { await api(`/admin/api/keys/${id}`, { method: 'DELETE' }); loadDashboard(); }
+async function logout() { await api('/admin/api/logout', { method: 'POST', body: '{}' }); showLoggedIn(false); }
+async function copyAccountToken(token) {
+  if (!token) return;
+  try {
+    await copyText(token);
+    document.getElementById('key-msg').textContent = '已复制账号 Token';
+  } catch (err) {
+    document.getElementById('key-msg').textContent = '复制 Token 失败，请尝试使用 HTTPS、localhost，或手动长按复制';
+  }
+}
+async function copyKey(id) {
+  const value = window.__keyMap?.[id];
+  if (!value) return;
+  try {
+    await copyText(value);
+    document.getElementById('key-msg').textContent = '已复制 Key';
+  } catch (err) {
+    document.getElementById('key-msg').textContent = '复制失败，请尝试使用 HTTPS、localhost，或手动长按复制';
+  }
+}
 
 document.addEventListener('DOMContentLoaded', () => {
+  document.getElementById('add-account-btn').addEventListener('click', addAccount);
+
+  document.getElementById('accounts').addEventListener('click', async (e) => {
+    const copyBtn = e.target.closest('.copy-token-btn');
+    if (copyBtn) {
+      await copyAccountToken(copyBtn.dataset.token || '');
+      return;
+    }
+    const btn = e.target.closest('.remove-account-btn');
+    if (!btn || btn.disabled) return;
+    await removeAccount(btn.dataset.userId);
+  });
+
+  document.getElementById('keys').addEventListener('click', async (e) => {
+    const copyBtn = e.target.closest('.copy-key-btn');
+    if (copyBtn) {
+      await copyKey(copyBtn.dataset.keyId);
+      return;
+    }
+    const deleteBtn = e.target.closest('.delete-key-btn');
+    if (deleteBtn) {
+      await deleteKey(deleteBtn.dataset.keyId);
+    }
+  });
+
+  document.getElementById('login-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    try {
+      await api('/admin/api/login', { method: 'POST', body: JSON.stringify({ password: fd.get('password') || '' }) });
+      document.getElementById('login-msg').textContent = '';
+      e.target.reset();
+      loadDashboard();
+    } catch (err) {
+      document.getElementById('login-msg').textContent = err.message;
+    }
+  });
+
   document.getElementById('key-form').addEventListener('submit', async (e) => {
     e.preventDefault();
     const fd = new FormData(e.target);
@@ -1407,6 +1937,46 @@ document.addEventListener('DOMContentLoaded', () => {
       document.getElementById('key-msg').textContent = err.message;
     }
   });
+
+  document.getElementById('toggle-keys-btn').addEventListener('click', () => {
+    revealKeys = !revealKeys;
+    document.getElementById('toggle-keys-btn').textContent = revealKeys ? '隐藏完整 Key' : '显示完整 Key';
+    loadDashboard();
+  });
+
+  document.getElementById('password-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    const payload = {
+      current_password: fd.get('current_password') || '',
+      new_password: fd.get('new_password') || '',
+    };
+    try {
+      const res = await api('/admin/api/change-password', { method: 'POST', body: JSON.stringify(payload) });
+      document.getElementById('password-msg').textContent = res.message || '密码已更新';
+      e.target.reset();
+      showLoggedIn(false);
+    } catch (err) {
+      document.getElementById('password-msg').textContent = err.message;
+    }
+  });
+
+  document.getElementById('rebuild-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    const payload = {
+      rebuild_cooldown: Number(fd.get('rebuild_cooldown') || 0),
+      rebuild_max_retries: Number(fd.get('rebuild_max_retries') || 1),
+    };
+    try {
+      const res = await api('/admin/api/rebuild-settings', { method: 'POST', body: JSON.stringify(payload) });
+      document.getElementById('rebuild-msg').textContent = `已保存：冷却 ${res.rebuild_cooldown}s，重试上限 ${res.rebuild_max_retries}`;
+      loadDashboard();
+    } catch (err) {
+      document.getElementById('rebuild-msg').textContent = err.message;
+    }
+  });
+
   loadDashboard();
   setInterval(loadDashboard, 8000);
 });
@@ -1454,6 +2024,7 @@ async def admin_css():
     return Response(
         content=_read_admin_asset(ADMIN_CSS, ADMIN_CSS_FALLBACK),
         media_type="text/css",
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
     )
 
 
@@ -1462,6 +2033,7 @@ async def admin_js():
     return Response(
         content=_read_admin_asset(ADMIN_JS, ADMIN_JS_FALLBACK),
         media_type="application/javascript",
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
     )
 
 
