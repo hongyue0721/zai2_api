@@ -1,582 +1,488 @@
-# zai2api
+# zai2_api
 
-呜，笨蛋哥哥先别乱点啦，妹妹把这份说明书重新写好了。
+一个将 `chat.z.ai` 封装为 **OpenAI / Claude 兼容 API** 的本地代理服务，附带简易管理后台，方便统一接入第三方客户端、脚本和工具链。
 
-这是一个把 `chat.z.ai` 网页能力包装成常见 API 的项目。你可以把它理解成：
+## 功能特性
 
-- 上游是 `chat.z.ai`
-- 中间是 `zai2api`
-- 下游是各种 OpenAI / Claude 兼容客户端
+- 提供 **OpenAI 兼容接口**
+  - `GET /v1/models`
+  - `POST /v1/chat/completions`
+- 提供 **Claude Messages 兼容接口**
+  - `POST /v1/messages`
+- 支持 **流式响应**
+- 支持 **工具 / function calling 转换**
+- 内置 **管理后台**
+  - 管理员登录
+  - API Key 管理
+  - 账号池管理
+  - 仪表盘 / 统计信息
+  - 重建冷却与重试配置
+- 支持 **Windows / Linux** 部署
 
-也就是说，很多原本只能填 OpenAI 或 Claude 接口的工具，现在都可以绕过来接这个项目。
+---
 
-## 妹妹先讲重点
+## 项目结构
 
-- 支持 `OpenAI` 风格接口
-- 支持 `Claude Messages` 风格接口
-- 支持 `glm-5-think` / `glm-5-nothink`
-- 支持 Windows 部署
-- 支持 Linux / Ubuntu 24.04 部署
-- 带 `/admin` 管理页面
-- 支持账号池、API Key、失败重建策略管理
+```text
+zai2_api/
+├── main.py             # 上游 chat.z.ai 交互逻辑：鉴权、模型获取、创建会话、流式对话、清理会话
+├── openai.py           # FastAPI 服务入口，提供 OpenAI/Claude 兼容接口与管理后台
+├── claude_compat.py    # Claude Messages API 与 OpenAI 消息格式的转换逻辑
+├── web/                # 管理后台静态资源（admin.html / admin.css / admin.js）
+├── tools/              # 辅助工具目录
+├── requirements.txt    # Python 依赖
+├── webui_state.json    # 持久化状态：API Key、后台密码哈希、池配置等
+└── 启动服务.bat         # Windows 一键启动脚本
+```
 
-默认服务地址：
+---
 
-- `http://127.0.0.1:30016`
+## 工作原理
 
-常用接口：
+该项目本身不是模型服务，而是一个代理层：
+
+1. 与 `chat.z.ai` 建立访客/账号会话
+2. 获取模型信息
+3. 创建聊天上下文
+4. 将请求转发到上游
+5. 将响应转换为 OpenAI / Claude 兼容格式
+6. 视情况清理聊天会话
+
+因此，下游客户端只需要对接本项目暴露的本地 API。
+
+---
+
+## 已实现接口
+
+### OpenAI 兼容接口
+
+#### `GET /v1/models`
+
+获取可用模型列表。
+
+#### `POST /v1/chat/completions`
+
+OpenAI Chat Completions 兼容接口。
+
+支持能力：
+
+- `messages`
+- `model`
+- `stream`
+- tools / function calling
+- 与上游会话代理联动
+
+---
+
+### Claude 兼容接口
+
+#### `POST /v1/messages`
+
+Claude Messages API 兼容接口。
+
+支持能力：
+
+- 顶层 `system`
+- `messages`
+- 文本内容块
+- `tools`
+- `tool_choice`
+- `tool_use / tool_result`
+- 流式 / 非流式响应转换
+
+---
+
+## 管理后台
+
+### 入口
+
+```text
+GET /admin
+```
+
+静态资源：
+
+- `GET /admin/assets/admin.css`
+- `GET /admin/assets/admin.js`
+
+后台 API：
+
+- `POST /admin/api/login`
+- `POST /admin/api/logout`
+- `POST /admin/api/change-password`
+- `POST /admin/api/rebuild-settings`
+- `GET /admin/api/dashboard`
+- `GET /admin/api/keys`
+- `POST /admin/api/keys`
+- `DELETE /admin/api/keys/{key_id}`
+- `POST /admin/api/accounts`
+- `DELETE /admin/api/accounts/{user_id}`
+
+### 默认管理密码
+
+默认后台密码为：
+
+```text
+zai2api
+```
+
+**首次启动后请立即修改默认密码。**
+
+后台认证使用 Cookie，会写入 `admin_session`，有效期约 7 天。
+
+---
+
+## 状态与配置存储
+
+项目运行状态保存在：
+
+```text
+webui_state.json
+```
+
+已知包含字段：
+
+- `api_keys`
+- `target_pool_size`
+- `admin_password_hash`
+- `rebuild_cooldown`
+- `rebuild_max_retries`
+
+当前仓库默认状态中可见的配置值包括：
+
+- `target_pool_size`: `6`
+- `rebuild_cooldown`: `30`
+- `rebuild_max_retries`: `3`
+
+说明：
+
+- 后台密码以 **哈希** 形式保存，不保存明文
+- API Key 会记录创建时间、最后使用时间和请求次数
+
+---
+
+## 账号池与运行机制
+
+服务启动后会通过生命周期钩子自动初始化账号池，并在后台周期性维护。
+
+已知行为包括：
+
+- 启动时初始化 guest account pool
+- 若无可用账号，会按需创建
+- 后台维护任务约每 30 秒执行一次
+- 会清理失效 / 过期 / 空闲无效账号
+- 会尝试补齐账号池到目标大小
+
+这意味着项目更适合在**轻量、自用、受控环境**中运行。
+
+---
+
+## 快速开始
+
+## 环境要求
+
+- Python 3.10+
+- 可正常访问 `chat.z.ai`
+- Windows 或 Linux
+
+安装依赖：
+
+```bash
+pip install -r requirements.txt
+```
+
+---
+
+## 启动方式
+
+### Windows
+
+可直接双击：
+
+```text
+启动服务.bat
+```
+
+或命令行运行：
+
+```bash
+python openai.py
+```
+
+### Linux
+
+建议使用虚拟环境：
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python3 openai.py
+```
+
+> `openai.py` 中已引入 `uvicorn` 与 `FastAPI`，实际监听地址与端口请以代码运行参数为准。
+> README 历史说明中常见默认地址为 `http://127.0.0.1:30016`。
+
+---
+
+## 常用访问地址
+
+如果按默认方式启动，通常使用：
+
+```text
+http://127.0.0.1:30016
+```
+
+常用入口：
 
 - `GET /v1/models`
 - `POST /v1/chat/completions`
 - `POST /v1/messages`
 - `GET /admin`
 
-## 快速开始
+---
 
-笨蛋哥哥如果只想先跑起来，不想看长篇，那就先抄这一段。
+## 模型名称
 
-### Windows 最短版
+README 历史内容中提到的常用模型：
 
-1. 安装 Python 3
-2. 解压项目到本地
-3. 双击 `启动服务.bat`
-4. 等浏览器自动打开 `/admin`
+- `glm-5-think`
+- `glm-5-nothink`
 
-### Ubuntu 24.04 最短版
+如果你的客户端支持自定义模型名，可直接填写这些值。
 
-```bash
-apt update && apt install -y python3 python3-venv python3-pip
-cd /root/zai2_api
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-python openai.py
-```
+---
 
-然后打开：
+## 调用示例
 
-- `http://127.0.0.1:30016/admin`
-
-## 这个项目主要文件是做什么的
-
-- `main.py`
-  - 负责和 `chat.z.ai` 直接通信
-  - 包括游客登录、创建聊天、获取模型等
-- `openai.py`
-  - 负责启动 API 服务
-  - 提供 OpenAI / Claude 兼容接口
-  - 提供 `/admin` 管理页
-- `claude_compat.py`
-  - 负责 Claude 格式转换
-- `web/`
-  - 管理后台前端页面
-
-## 模型怎么填
-
-妹妹建议你直接记这两个：
-
-- `glm-5-think` = 开启思考
-- `glm-5-nothink` = 关闭思考
-
-如果你什么都不传，默认是开思考。
-
-## /admin 管理页有什么
-
-登录管理页后可以做这些：
-
-- 查看总请求、总成功、总失败
-- 查看每个 free 账号的调用情况
-- 增加 / 删除账号
-- 创建 / 删除 API Key
-- 随机生成 Key 或自定义 Key
-- 修改 admin 密码
-- 修改失败重建冷却时间和重试上限
-
-默认管理页地址：
-
-- `http://127.0.0.1:30016/admin`
-
-默认初始密码：
-
-- `zai2api`
-
-建议你登录后马上改掉，笨蛋哥哥不要偷懒。
-
-## Windows 部署
-
-### 方法 1：最省心的办法
-
-如果你是 Windows 用户，最简单就是直接双击：
-
-- `启动服务.bat`
-
-这个脚本现在会自动做这些事：
-
-- 检查端口占用
-- 自动创建 `.venv`
-- 自动安装依赖
-- 自动启动服务
-- 等服务真的 ready 后再打开浏览器到 `/admin`
-
-所以大多数情况下，你只要：
-
-1. 安装 Python 3
-2. 把项目解压到本地
-3. 双击 `启动服务.bat`
-
-就差不多能用了。
-
-### 方法 2：手动启动
-
-如果你不想双击 bat，也可以自己手动来。
-
-先进入项目目录：
-
-```bat
-cd /d D:\zai2api
-```
-
-创建虚拟环境：
-
-```bat
-python -m venv .venv
-```
-
-激活虚拟环境：
-
-```bat
-.venv\Scripts\activate
-```
-
-安装依赖：
-
-```bat
-python -m pip install --upgrade pip
-pip install -r requirements.txt
-```
-
-启动服务：
-
-```bat
-python openai.py
-```
-
-启动后打开：
-
-```text
-http://127.0.0.1:30016/admin
-```
-
-### Windows 常见问题
-
-#### 1. 双击 bat 后浏览器打不开
-
-先别慌，先看控制台有没有红字报错。
-
-最常见原因：
-
-- Python 没装
-- 依赖没装成功
-- 端口被占用
-
-#### 2. 提示缺少模块，比如 `httpcore`
-
-那就是依赖没装好，执行：
-
-```bat
-.venv\Scripts\activate
-pip install -r requirements.txt
-```
-
-#### 3. 127.0.0.1 拒绝连接
-
-这通常说明服务没真正启动起来。
-
-别只看浏览器，要看启动窗口最后有没有报错。
-
-## Linux / Ubuntu 24.04 部署
-
-下面妹妹按 Ubuntu 24.04 来写，别的 Linux 也可以参考。
-
-假设项目路径是：
-
-- `/root/zai2_api`
-
-### 第 1 步：安装基础环境
+## 1. 获取模型列表
 
 ```bash
-apt update && apt upgrade -y
-apt install -y python3 python3-venv python3-pip nginx apache2-utils curl
+curl http://127.0.0.1:30016/v1/models \
+  -H "Authorization: Bearer YOUR_API_KEY"
 ```
 
-### 第 2 步：把项目放到服务器
+---
 
-比如放到：
-
-- `/root/zai2_api`
-
-检查一下：
+## 2. OpenAI Chat Completions
 
 ```bash
-cd /root/zai2_api
-ls -lah
-```
-
-你至少应该能看到：
-
-- `main.py`
-- `openai.py`
-- `claude_compat.py`
-- `requirements.txt`
-- `web/`
-
-### 第 3 步：创建虚拟环境
-
-```bash
-cd /root/zai2_api
-python3 -m venv .venv
-source .venv/bin/activate
-```
-
-### 第 4 步：安装依赖
-
-```bash
-pip install --upgrade pip
-pip install -r requirements.txt
-```
-
-测试依赖：
-
-```bash
-python -c "import fastapi,uvicorn,httpx,httpcore; print('ok')"
-```
-
-如果输出 `ok`，说明环境好了。
-
-### 第 5 步：手动启动测试
-
-```bash
-cd /root/zai2_api
-source .venv/bin/activate
-python openai.py
-```
-
-再开一个终端测试：
-
-```bash
-curl http://127.0.0.1:30016/v1/models
-```
-
-如果能返回 JSON，说明服务已经起来啦。
-
-管理页测试：
-
-```bash
-curl http://127.0.0.1:30016/admin
-```
-
-### 第 6 步：配置 systemd 开机自启
-
-创建服务文件：
-
-```bash
-nano /etc/systemd/system/zai2api.service
-```
-
-填入：
-
-```ini
-[Unit]
-Description=zai2api service
-After=network.target
-
-[Service]
-Type=simple
-User=root
-WorkingDirectory=/root/zai2_api
-Environment=LOG_LEVEL=INFO
-Environment=POOL_SIZE=3
-Environment=TOKEN_MAX_AGE=480
-ExecStart=/root/zai2_api/.venv/bin/python /root/zai2_api/openai.py
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-```
-
-启用并启动：
-
-```bash
-systemctl daemon-reload
-systemctl enable zai2api
-systemctl start zai2api
-systemctl status zai2api
-```
-
-看日志：
-
-```bash
-journalctl -u zai2api -f
-```
-
-### 第 7 步：配置 Nginx 反代
-
-先创建一个访问密码：
-
-```bash
-htpasswd -c /etc/nginx/.htpasswd admin
-```
-
-创建配置：
-
-```bash
-nano /etc/nginx/sites-available/zai2api
-```
-
-内容如下：
-
-```nginx
-server {
-    listen 80;
-    server_name _;
-
-    client_max_body_size 20m;
-
-    auth_basic "Restricted";
-    auth_basic_user_file /etc/nginx/.htpasswd;
-
-    location / {
-        proxy_pass http://127.0.0.1:30016;
-        proxy_http_version 1.1;
-
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-
-        proxy_buffering off;
-        proxy_read_timeout 3600s;
-        proxy_send_timeout 3600s;
-    }
-}
-```
-
-启用配置：
-
-```bash
-ln -s /etc/nginx/sites-available/zai2api /etc/nginx/sites-enabled/zai2api
-nginx -t
-systemctl restart nginx
-```
-
-### 第 8 步：放行端口
-
-如果你启用了 UFW：
-
-```bash
-ufw allow OpenSSH
-ufw allow 'Nginx Full'
-ufw enable
-ufw status
-```
-
-如果你是云服务器，还要记得开放：
-
-- `80`
-- `443`（如果以后上 HTTPS）
-
-### 第 9 步：测试接口
-
-模型列表：
-
-```bash
-curl -u admin:你的密码 http://你的服务器IP/v1/models
-```
-
-OpenAI 风格：
-
-```bash
-curl -u admin:你的密码 http://你的服务器IP/v1/chat/completions \
+curl http://127.0.0.1:30016/v1/chat/completions \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_API_KEY" \
   -d '{
     "model": "glm-5-think",
     "messages": [
-      {"role": "user", "content": "你好"}
+      { "role": "user", "content": "你好，介绍一下你自己" }
     ],
     "stream": false
   }'
 ```
 
-Claude 风格：
+---
+
+## 3. Claude Messages
 
 ```bash
-curl -u admin:你的密码 http://你的服务器IP/v1/messages \
+curl http://127.0.0.1:30016/v1/messages \
   -H "Content-Type: application/json" \
+  -H "x-api-key: YOUR_API_KEY" \
   -d '{
-    "model": "glm-5-nothink",
+    "model": "glm-5-think",
+    "max_tokens": 1024,
     "messages": [
-      {"role": "user", "content": "请简单介绍你自己"}
-    ],
-    "stream": false
+      { "role": "user", "content": "你好" }
+    ]
   }'
 ```
 
-## 客户端怎么填
+---
 
-如果你用的是 OpenAI 兼容客户端，一般这样填：
+## API Key 鉴权说明
 
-- Base URL: `http://你的地址/v1`
-- Model: `glm-5-think` 或 `glm-5-nothink`
+项目支持 API Key 机制。
 
-### API Key 怎么填
+已知行为：
 
-现在这个项目支持在 `/admin` 里创建 API Key。
+- 如果状态中已存在 API Key，API 请求需要携带有效 Key
+- 否则相关接口会返回 `401`
 
-如果你已经创建了 key，请在客户端里带上：
+接入时建议统一使用后台创建的 API Key。
 
-```text
-Authorization: Bearer 你的key
+---
+
+## Claude 兼容层说明
+
+`claude_compat.py` 已实现以下转换能力：
+
+- `system` 字段转换
+- 文本消息块提取
+- Claude `tools` 转 OpenAI function schema
+- `tool_choice` 规则转换
+- `tool_use / tool_result` 转换
+- SSE 流式事件转换
+- 非流式结果封装
+
+也就是说，该项目不仅是简单转发，还包含一层协议适配。
+
+---
+
+## 第三方客户端接入
+
+对于支持 OpenAI 协议的客户端，可按以下方式接入：
+
+- **Base URL**：`http://127.0.0.1:30016/v1`
+- **API Key**：后台创建的 Key
+- **Model**：`glm-5-think` 或 `glm-5-nothink`
+
+典型场景：
+
+- OpenAI SDK
+- 支持自定义 Base URL 的桌面客户端
+- 各类自动化脚本
+- 多模型聚合工具
+
+---
+
+## 部署建议
+
+### 本地试用
+
+直接运行：
+
+```bash
+python openai.py
 ```
 
-如果你还没创建 key，那就先打开 `/admin` 自己生成一个，笨蛋哥哥不要忘记这一步。
+### 长期运行
+
+建议配合：
+
+- `systemd`
+- `nginx`
+- HTTPS
+- 内网访问控制
+- API Key 管理
+- 定期备份状态文件
+
+---
 
 ## 常见问题
 
-### 1. 为什么访问 `/` 是 404
+### 1. 访问 `/` 没有页面？
 
-因为这个项目没有首页。
-
-你应该访问：
+这是 API 服务，不保证提供首页。请直接访问：
 
 - `/admin`
 - `/v1/models`
-- `/v1/chat/completions`
-- `/v1/messages`
 
-### 2. 为什么服务起不来
+---
 
-最常见原因：
+### 2. 为什么接口返回 401？
 
-- Python 环境没装好
-- `.venv` 没创建
-- 依赖没安装
-- 端口被占用
-- 上游异常
+优先检查：
 
-Windows 先看 bat 窗口输出，Linux 先看：
+- 是否已在后台创建 API Key
+- 是否正确携带 `Authorization: Bearer ...`
+- Claude 调用时是否正确传递 `x-api-key`
 
-```bash
-journalctl -u zai2api -f
+---
+
+### 3. 启动后不能正常调用？
+
+请检查：
+
+- Python 版本
+- 依赖是否安装完整
+- 本机是否能访问 `chat.z.ai`
+- 端口是否被占用
+- 账号池是否初始化成功
+
+---
+
+### 4. 后台无法登录？
+
+如果未修改过密码，默认值为：
+
+```text
+zai2api
 ```
 
-### 3. 为什么成功率不变
+如果已修改，请检查 `webui_state.json` 中保存的密码哈希对应的实际密码。
 
-现在新版已经修过统计逻辑了。
+---
 
-如果你发现还是不对，先刷新 `/admin` 再观察；如果还是奇怪，把复现步骤贴出来，妹妹陪你看。
+## 安全提醒
 
-### 4. 账号池是不是越大越好
+该项目默认更适合：
 
-不是。
+- 自用
+- 测试环境
+- 内网环境
+- 受控访问环境
 
-建议：
+不建议直接裸露在公网。
 
-- 自己用：`POOL_SIZE=1` 到 `3`
-- 少量人一起用：`POOL_SIZE=3` 到 `5`
-- 别一上来就开太大
+至少应做到：
 
-### 5. 这个项目稳定吗
+- 立即修改默认后台密码
+- 为 API 设置独立 Key
+- 限制来源 IP
+- 通过反向代理增加访问控制
+- 启用 HTTPS
+- 妥善保护 `webui_state.json`
 
-能用，但它不是官方商用稳定 API。
+---
 
-因为它本质上还是网页协议代理：
+## 更新建议
 
-- 上游可能改
-- 游客号可能失效
-- 并发太高可能不稳
+如果你通过 Git 获取代码：
 
-所以更适合：
-
-- 个人使用
-- 小规模共享
-- 开发测试
-
-## 项目更新办法
-
-笨蛋哥哥如果后面想更新项目，别直接乱覆盖，按下面来比较稳。
-
-### Windows 更新
-
-如果你是手动下载压缩包那种方式：
-
-1. 先备份你现在正在用的目录
-2. 下载新版本代码
-3. 把你自己的配置文件保留好
-4. 再重新运行 `启动服务.bat`
-
-如果你是 git 拉下来的：
-
-```bat
-cd /d D:\zai2api
+```bash
 git pull
-```
-
-如果更新后依赖有变化，再执行：
-
-```bat
-.venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-### Ubuntu 更新
+更新前建议备份：
 
-如果服务器目录本身是 git 仓库：
+- `webui_state.json`
+- 反向代理配置
+- 本地自定义启动方式
+- 任何你修改过的代码文件
 
-```bash
-cd /root/zai2_api
-git fetch origin
-git pull
-source .venv/bin/activate
-pip install -r requirements.txt
-systemctl restart zai2api
-systemctl status zai2api
-```
+---
 
-如果你用的是指定分支，比如：
+## 协议 / License
 
-```bash
-cd /root/zai2_api
-git fetch origin
-git checkout hongyue0721-patch-1
-git pull origin hongyue0721-patch-1
-source .venv/bin/activate
-pip install -r requirements.txt
-systemctl restart zai2api
-```
+当前仓库页面**未见公开 License 文件**，也未显示 GitHub 识别的开源协议。
 
-更新完建议再看一眼日志：
+这意味着：
 
-```bash
-journalctl -u zai2api -n 100 --no-pager
-```
+- 当前项目**默认不等同于开源授权**
+- 除非作者后续补充 `LICENSE`，否则他人通常**不应默认拥有复制、修改、再分发权限**
 
-### 更新时要特别注意什么
+如果你是仓库维护者，建议按你的发布意图补充其一：
 
-- `webui_state.json` 里有你管理页的密码、API Key 和部分配置
-- 如果你不想丢这些数据，更新时记得保留这个文件
-- 如果你改过 `openai.py`、`web/` 目录、或者 `启动服务.bat`，更新时也要注意别被新文件覆盖掉
+- `MIT`
+- `Apache-2.0`
+- `GPL-3.0`
+- `BSD-3-Clause`
 
-## 最后，妹妹再帮你总结一下
+补充后 GitHub 才会正确识别项目协议。
 
-如果你很懒，不想看长篇，就记住这些：
+---
 
-- Windows 直接双击 `启动服务.bat`
-- Linux 推荐 `systemd + nginx`
-- 管理页是 `/admin`
-- 初始密码是 `zai2api`
-- 模型常用 `glm-5-think` 和 `glm-5-nothink`
-- 建议先小规模使用，不要一开始就高并发乱冲
+## 免责声明
 
-如果你照着做还是不会，那就把报错贴出来。
+本项目依赖上游站点的接口行为与可用性。
 
-笨蛋哥哥别硬撑，妹妹会继续陪你修。
+上游一旦变更：
+
+- 接口结构
+- 鉴权逻辑
+- 风控策略
+- 页面交互参数
+
+都可能导致兼容失效。
+
+请仅在你有权使用的环境中部署和测试，并自行承担相关使用风险。
